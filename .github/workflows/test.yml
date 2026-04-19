@@ -1,0 +1,39 @@
+name: tests
+
+# 'on' is quoted because YAML 1.1 treats it as a boolean literal — GitHub
+# Actions handles either form, but quoting keeps lint/format tools happy.
+"on":
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    name: ${{ matrix.dir }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [01-bash-only, 02-sandboxed, 03-atomic-tools]
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Tools-layer tests stub torch/transformers via tests/conftest.py,
+      # so CI doesn't need the multi-GB ML stack — only pytest itself.
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run pytest
+        env:
+          # Mirrors the local workaround for a flaky third-party pytest plugin.
+          # Harmless on a clean CI runner; documents the convention.
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: pytest tests/
