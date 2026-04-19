@@ -1,0 +1,16 @@
+# MiniCode Agent v3 — runtime dependencies
+#
+# Versions reflect the environment this was built and tested against.
+# Lower bounds are intentional (lets users pick newer compatible versions);
+# upper bounds guard against API breaks we know would bite.
+
+# Qwen 2.5 / 3.x chat_template needs >=4.40. v5 is what we tested on.
+transformers>=4.40,<6
+safetensors>=0.4
+# torch is highly platform-specific (CUDA / CPU build). Pin a floor only.
+# Install the right wheel from https://pytorch.org/get-started/locally/ first,
+# then `pip install -r requirements.txt` will skip torch if already present.
+torch>=2.1
+
+# Dev / test only — uncomment if you intend to run `pytest tests/`
+# pytest>=8
