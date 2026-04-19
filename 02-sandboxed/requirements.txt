@@ -1,0 +1,8 @@
+# 02-sandboxed — runtime dependencies
+#
+# 跑模型才需要装这些。只跑 pytest 不需要 (tests/conftest.py 把 torch/transformers
+# stub 掉了), 装 requirements-dev.txt 即可。
+
+transformers>=4.40,<6
+safetensors>=0.4
+torch>=2.1

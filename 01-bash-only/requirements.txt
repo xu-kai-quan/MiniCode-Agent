@@ -1,0 +1,10 @@
+# 01-bash-only — runtime dependencies
+#
+# 跑模型才需要装这些。只跑 pytest 不需要 (tests/conftest.py 把 torch/transformers
+# stub 掉了), 装 requirements-dev.txt 即可。
+
+transformers>=4.40,<6
+safetensors>=0.4
+# torch wheel 跟平台 (CPU/CUDA) 强相关, 只锁下界。装 wheel 请按
+# https://pytorch.org/get-started/locally/ 选好版本。
+torch>=2.1

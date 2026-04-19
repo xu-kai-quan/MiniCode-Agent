@@ -1,0 +1,2 @@
+# Dev / test only — 不装 torch/transformers 也能跑 pytest
+pytest>=8

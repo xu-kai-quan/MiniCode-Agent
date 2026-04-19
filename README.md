@@ -1,22 +1,26 @@
 # MiniCode Agent
 
+[![tests](https://github.com/xu-kai-quan/MiniCode-Agent/actions/workflows/test.yml/badge.svg)](https://github.com/xu-kai-quan/MiniCode-Agent/actions/workflows/test.yml)
+
 一个用本地 Qwen3.5-2B 模型驱动的**最小化编码 agent**, 单文件实现, 没有任何框架封装, 适合用来理解"AI agent 到底是怎么工作的"。
 
-仓库里有两个独立项目, 各有各的 README, 想读哪个就进哪个目录:
+仓库里有三个独立项目, 按学习顺序排列, 各有各的 README, 想读哪个就进哪个目录:
 
 | 目录 | 定位 | 适合 |
 |---|---|---|
-| [v1_mvp/](v1_mvp/) | 一次性任务 agent, 给一句话跑完就退出 | 第一次接触 agent, 想看清最小骨架 |
-| [v2_workspace/](v2_workspace/) | 交互式 REPL agent, 类似 Claude Code 风格 | 想看 agent 怎么演化成可用的日常工具 |
+| [01-bash-only/](01-bash-only/) | 只有 5 个工具的一次性任务 agent, 跑完一句话就退出 | 第一次接触 agent, 想看清最小骨架 |
+| [02-sandboxed/](02-sandboxed/) | 加了交互式 REPL + bash 沙箱探测 + 大文件分片写入 | 想看 agent 怎么演化成可用的日常工具 |
+| [03-atomic-tools/](03-atomic-tools/) | 三层工具架构 (LS/Glob/Grep/Read 原子层) + 读后写乐观锁 + 42 个 pytest | 想看怎么把 agent 做扎实, 经得起测试 |
 
-两个项目都只有一个 `todo.py` 文件, 不超过 600 行, 没有 langchain / autogen 之类的框架包装 — **你看到的就是全部真相**。
+三个项目都只有一个 `todo.py` 文件, 没有 langchain / autogen 之类的框架包装 — **你看到的就是全部真相**。
 
 ## 快速开始
 
 挑一个目录进去, 按各自 README 跑:
 
-- [v1_mvp/README.md](v1_mvp/README.md)
-- [v2_workspace/README.md](v2_workspace/README.md)
+- [01-bash-only/README.md](01-bash-only/README.md)
+- [02-sandboxed/README.md](02-sandboxed/README.md)
+- [03-atomic-tools/README.md](03-atomic-tools/README.md)
 
 ## 共同依赖
 
@@ -25,6 +29,10 @@ pip install torch transformers safetensors
 ```
 
 需要本地放一份 Qwen3.5-2B 模型 (默认路径 `E:/MYSELF/model/qwen/Qwen3.5-2B/`, 各自 `todo.py` 顶部可改)。
+
+## 测试
+
+每个版本都有 pytest 套件, CI 在 GitHub Actions 上每次 push / PR 自动跑 — 见 [.github/workflows/test.yml](.github/workflows/test.yml). 测试不依赖 torch/transformers (`tests/conftest.py` 把它们 stub 掉了), 所以 CI 不需要拉几个 GB 的 ML 栈。
 
 ## 设计理念
 
