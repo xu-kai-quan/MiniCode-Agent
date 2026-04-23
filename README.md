@@ -33,13 +33,14 @@
 
 ---
 
-## 三个版本
+## 四个版本
 
 | 目录 | 这一版的核心新东西 | 适合谁读 |
 |---|---|---|
 | [01-bash-only/](01-bash-only/) | 最小 ReAct + 5 个工具 (bash / read / write / edit / todo), 一次性任务模式, 跑完就退出 | 第一次接触 agent, 想看清最小骨架 |
 | [02-sandboxed/](02-sandboxed/) | 加交互式 REPL + bash 沙箱探测 (排除 WSL System32, 避免 UTF-16 输出冲突) + 大文件分片写入 | 想看 agent 怎么演化成可用的日常工具 |
 | [03-atomic-tools/](03-atomic-tools/) | 三层工具架构 (LS/Glob/Grep/Read 原子层) + 读后写乐观锁 (mtime + size cache, NOT_READ / CONFLICT) + 42 个 pytest + GitHub Actions CI | 想看怎么把 agent 做扎实, 经得起测试 |
+| [04-atomic-tools/](04-atomic-tools/) | 后端换 Ollama HTTP (默认 `qwen2.5-coder:7b`, 能力跳档) + OpenAI 结构化 tool_calls + `apply_patch` 跨文件 unified diff (两阶段锁 + 原子回滚) + 66 个 pytest | 想看 agent 怎么从"能跑"演进到"跨文件原子改动" |
 
 每一版都只有一个 `todo.py` 文件 — **你看到的就是全部真相**, 没有任何框架包装。
 
@@ -78,7 +79,7 @@ pip install pytest
 pytest tests/        # 42 个测试, ~0.6 秒, 不需要 torch
 ```
 
-三个版本都有 CI, 每次 push 自动跑 — 见 [.github/workflows/test.yml](.github/workflows/test.yml)。
+四个版本都有 CI, 每次 push 自动跑 — 见 [.github/workflows/test.yml](.github/workflows/test.yml)。
 
 ## 设计理念
 

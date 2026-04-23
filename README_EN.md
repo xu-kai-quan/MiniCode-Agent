@@ -29,13 +29,14 @@ If you've ever asked "how does an AI coding agent actually work under the hood?"
 - ❌ Not multi-agent — single agent, single conversation
 - ❌ Not cloud-API based — runs **100% locally** with a Qwen safetensors checkpoint
 
-## The three iterations
+## The four iterations
 
 | Directory | What's new in this step | Read it if... |
 |---|---|---|
 | [01-bash-only/](01-bash-only/) | **Minimal ReAct + 5 tools** (bash / read / write / edit / todo). One-shot, no REPL. | You're new to agents and want to see the smallest possible working skeleton. |
 | [02-sandboxed/](02-sandboxed/) | **Interactive REPL** + **bash sandbox detection** (excludes WSL System32 to avoid UTF-16 issues) + chunked file writes for output too large for one turn | You want to see how an MVP grows into something usable day-to-day. |
 | [03-atomic-tools/](03-atomic-tools/) | **Three-layer tool architecture** (LS/Glob/Grep/Read atomic layer) + **read-before-write optimistic lock** (mtime + size cache, NOT_READ / CONFLICT error codes) + **42 pytest tests** + GitHub Actions CI | You want to see how to make an agent solid enough to test. |
+| [04-atomic-tools/](04-atomic-tools/) | **Ollama HTTP backend** (defaults to `qwen2.5-coder:7b`, big capability jump) + OpenAI-style structured `tool_calls` + **`apply_patch`** — cross-file unified diff with two-phase locking and atomic rollback + **66 pytest tests** | You want to see how an agent evolves from "it works" to "cross-file atomic edits". |
 
 Every version is **a single `todo.py` file** — no langchain, no autogen, no hidden abstractions. **What you see is everything.**
 
@@ -74,7 +75,7 @@ pip install pytest
 pytest tests/        # 42 tests, ~0.6s, no torch needed
 ```
 
-All three versions have CI on every push — see [.github/workflows/test.yml](.github/workflows/test.yml).
+All four versions have CI on every push — see [.github/workflows/test.yml](.github/workflows/test.yml).
 
 ## Design principles
 
