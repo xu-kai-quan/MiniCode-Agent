@@ -13,15 +13,18 @@
 from __future__ import annotations
 
 import fnmatch
+import inspect
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from types import UnionType
+from typing import Any, Callable, Union, get_args, get_origin
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
@@ -174,6 +177,104 @@ class Tool:
                 "parameters": self.parameters,
             },
         }
+
+    @classmethod
+    def from_function(
+        cls,
+        func: Callable[..., ToolResult],
+        description: str,
+        *,
+        name: str | None = None,
+        handler: Callable[..., ToolResult] | None = None,
+        param_docs: dict[str, str] | None = None,
+        overrides: dict[str, dict] | None = None,
+        exclude: set[str] | None = None,
+    ) -> "Tool":
+        """从 handler 签名反射出 JSON schema — 默认值/类型/required 都不用手写.
+
+        - func: 用它的 signature + type hints 生成 schema. 也默认当 handler.
+        - handler: 真正被 dispatch 调用的函数. 需要闭包额外依赖时才传 (如 apply_patch).
+        - param_docs: {参数名: 描述}. 模型看到的参数说明写这里, 不靠 docstring 解析.
+        - overrides: {参数名: JSON schema 片段}. 反射搞不定的参数 (如 list[TypedDict]) 手工覆盖.
+        - exclude: 从 schema 里剔掉的参数名 (模型不该看见, 由 handler 闭包注入).
+        """
+        params = _schema_from_signature(
+            func, param_docs or {}, overrides or {}, exclude or set(),
+        )
+        return cls(
+            name=name or func.__name__,
+            description=description,
+            parameters=params,
+            handler=handler or func,
+        )
+
+
+# Python 类型 → JSON Schema 基本类型. 没列出的类型(如 Path)走 object, 但目前没这需求.
+_PY_TO_JSON_TYPE: dict[type, str] = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
+}
+
+
+def _type_to_schema(tp: Any) -> dict:
+    """把 Python 类型注解翻成 JSON Schema 片段. 只覆盖当前工具用到的形态."""
+    origin = get_origin(tp)
+
+    # X | None / Optional[X] / Union[X, None]: 剥掉 None, 取另一边.
+    if origin is Union or origin is UnionType:
+        non_none = [a for a in get_args(tp) if a is not type(None)]
+        if len(non_none) == 1:
+            return _type_to_schema(non_none[0])
+        # 多选一的 Union 当前没工具用; 真要用再扩 oneOf.
+        return {}
+
+    # list[X] / dict[...] 等带参数的泛型: 只认外壳类型.
+    if origin in _PY_TO_JSON_TYPE:
+        return {"type": _PY_TO_JSON_TYPE[origin]}
+
+    if isinstance(tp, type) and tp in _PY_TO_JSON_TYPE:
+        return {"type": _PY_TO_JSON_TYPE[tp]}
+
+    return {}  # 兜底: 不声明类型, schema 仍合法, 只是信息更少
+
+
+def _schema_from_signature(
+    func: Callable[..., Any],
+    param_docs: dict[str, str],
+    overrides: dict[str, dict],
+    exclude: set[str],
+) -> dict:
+    """inspect.signature + get_type_hints 反射出 {properties, required}."""
+    sig = inspect.signature(func)
+    try:
+        hints = typing.get_type_hints(func)
+    except Exception:
+        hints = {}
+
+    properties: dict[str, dict] = {}
+    required: list[str] = []
+    for pname, p in sig.parameters.items():
+        if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue  # *args/**kwargs 不进 schema
+        if pname in exclude:
+            continue
+
+        if pname in overrides:
+            properties[pname] = dict(overrides[pname])
+        else:
+            schema = _type_to_schema(hints.get(pname, Any))
+            if pname in param_docs:
+                schema["description"] = param_docs[pname]
+            properties[pname] = schema
+
+        if p.default is inspect.Parameter.empty:
+            required.append(pname)
+
+    return {"type": "object", "properties": properties, "required": required}
 
 
 class ReadCache:
@@ -994,102 +1095,75 @@ TODO = TodoManager()
 # 工具注册
 # =================================================================
 
+_TODO_ITEMS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "text": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "completed"],
+            },
+        },
+        "required": ["id", "text"],
+    },
+}
+
+
 def build_default_registry(terminal: TerminalTool) -> ToolRegistry:
     reg = ToolRegistry()
 
     # ---- 原子工具 (主链路) ----
-    reg.register(Tool(
-        name="LS",
+    reg.register(Tool.from_function(
+        tool_ls, name="LS",
         description="List entries in a directory (non-recursive). Use Glob for recursive.",
-        parameters={
-            "type": "object",
-            "properties": {"path": {"type": "string", "description": "Directory path. Default '.'"}},
-            "required": [],
-        },
-        handler=lambda path=".": tool_ls(path),
+        param_docs={"path": "Directory path. Default '.'"},
     ))
-    reg.register(Tool(
-        name="Glob",
+    reg.register(Tool.from_function(
+        tool_glob, name="Glob",
         description="Find files by name pattern (recursive). Pattern is glob syntax like '**/*.py'.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "Glob pattern, e.g. '**/*.py'"},
-                "path": {"type": "string", "description": "Base path. Default '.'"},
-            },
-            "required": ["pattern"],
+        param_docs={
+            "pattern": "Glob pattern, e.g. '**/*.py'",
+            "path": "Base path. Default '.'",
         },
-        handler=lambda pattern, path=".": tool_glob(pattern, path),
     ))
-    reg.register(Tool(
-        name="Grep",
+    reg.register(Tool.from_function(
+        tool_grep, name="Grep",
         description="Search file contents by regex. Returns file:line:text matches.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "Regex pattern"},
-                "path": {"type": "string", "description": "File or directory. Default '.'"},
-                "ignore_case": {"type": "boolean", "description": "Case-insensitive. Default false"},
-                "file_pattern": {"type": "string", "description": "Only search files matching this glob (e.g. '*.py')"},
-            },
-            "required": ["pattern"],
+        param_docs={
+            "pattern": "Regex pattern",
+            "path": "File or directory. Default '.'",
+            "ignore_case": "Case-insensitive. Default false",
+            "file_pattern": "Only search files matching this glob (e.g. '*.py')",
         },
-        handler=lambda pattern, path=".", ignore_case=False, file_pattern=None:
-            tool_grep(pattern, path, ignore_case, file_pattern),
     ))
-    reg.register(Tool(
-        name="Read",
+    reg.register(Tool.from_function(
+        tool_read, name="Read",
         description="Read a text file with line numbers. Pass limit/offset for partial reads.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "limit": {"type": "integer", "description": "Max lines to return"},
-                "offset": {"type": "integer", "description": "Skip this many lines from start"},
-            },
-            "required": ["path"],
+        param_docs={
+            "limit": "Max lines to return",
+            "offset": "Skip this many lines from start",
         },
-        handler=lambda path, limit=None, offset=0: tool_read(path, limit, offset),
     ))
-    reg.register(Tool(
-        name="write_file",
+    reg.register(Tool.from_function(
+        tool_write, name="write_file",
         description="Create or overwrite a file with the given content.",
-        parameters={
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-            "required": ["path", "content"],
-        },
-        handler=lambda path, content: tool_write(path, content),
     ))
-    reg.register(Tool(
-        name="append_file",
+    reg.register(Tool.from_function(
+        tool_append, name="append_file",
         description=(
             "Append content to the end of a file (creates it if missing). "
             "Use this to write files too large for a single write_file call."
         ),
-        parameters={
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-            "required": ["path", "content"],
-        },
-        handler=lambda path, content: tool_append(path, content),
     ))
-    reg.register(Tool(
-        name="edit_file",
+    reg.register(Tool.from_function(
+        tool_edit, name="edit_file",
         description="Replace a unique old_text with new_text inside a file.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "old_text": {"type": "string"},
-                "new_text": {"type": "string"},
-            },
-            "required": ["path", "old_text", "new_text"],
-        },
-        handler=lambda path, old_text, new_text: tool_edit(path, old_text, new_text),
     ))
-    reg.register(Tool(
-        name="apply_patch",
+    reg.register(Tool.from_function(
+        tool_apply_patch, name="apply_patch",
         description=(
             "Apply a unified-diff patch across one or more files atomically. "
             "Supports modify (--- a/path +++ b/path), create (--- /dev/null +++ b/path), "
@@ -1099,62 +1173,28 @@ def build_default_registry(terminal: TerminalTool) -> ToolRegistry:
             "modified. Prefer this over multiple edit_file calls when changes span files "
             "or a single file has multiple edits."
         ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "patch": {
-                    "type": "string",
-                    "description": "Unified diff text. Paths may use 'a/' and 'b/' prefixes.",
-                },
-            },
-            "required": ["patch"],
-        },
+        # handler 闭包 reg.read_cache; schema 从 tool_apply_patch 反射, 但排除 read_cache.
         handler=lambda patch: tool_apply_patch(patch, reg.read_cache),
+        param_docs={"patch": "Unified diff text. Paths may use 'a/' and 'b/' prefixes."},
+        exclude={"read_cache"},
     ))
-    reg.register(Tool(
-        name="todo",
+    reg.register(Tool.from_function(
+        TODO.update, name="todo",
         description=(
             "Write the full todo list. Pass every item each call. "
             "Statuses: pending, in_progress (at most one), completed."
         ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "text": {"type": "string"},
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                            },
-                        },
-                        "required": ["id", "text"],
-                    },
-                }
-            },
-            "required": ["items"],
-        },
-        handler=lambda items: TODO.update(items),
+        overrides={"items": _TODO_ITEMS_SCHEMA},
     ))
 
     # ---- bash (兜底, 不是主链路) ----
-    reg.register(Tool(
-        name="bash",
+    reg.register(Tool.from_function(
+        terminal.run, name="bash",
         description=(
             "Fallback shell. Prefer LS/Glob/Grep/Read for file operations. "
             "Use bash only for things atomic tools don't cover: git, "
             "running scripts, package managers, etc."
         ),
-        parameters={
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
-        handler=lambda command: terminal.run(command),
     ))
     return reg
 
