@@ -8,3 +8,7 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+# Secrets — anything matching .env (but allow .env.example template)
+.env
+.env.local
+!.env.example

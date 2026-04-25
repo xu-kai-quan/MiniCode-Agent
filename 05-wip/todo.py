@@ -29,10 +29,64 @@ from typing import Any, Callable, Union, get_args, get_origin
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
+
+# ---------- .env 加载 (零依赖, 50 行内) ----------
+
+def _load_dotenv(path: Path) -> None:
+    """读 .env 文件, 把 KEY=value 填进 os.environ — 但不覆盖已存在的环境变量.
+
+    支持: KEY=value, 行首/末空白, # 注释, KEY="quoted value".
+    不支持: 多行值, ${VAR} 插值, export KEY=... — 简单足够.
+
+    设计选择: 已存在的环境变量优先 — 让 shell 里 `set MINICODE_BACKEND=ollama` 能临时
+    覆盖 .env 里的设置. .env 是默认, 命令行/shell 是覆盖.
+    """
+    if not path.is_file():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            # 剥引号 (双或单)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except OSError:
+        pass  # .env 读失败就当没有, 不阻塞启动
+
+
+# 在读任何 MINICODE_* 环境变量前加载 .env. 项目根 (todo.py 同级) 的 .env 优先.
+_load_dotenv(Path(__file__).parent / ".env")
+
+
 # ---------- 配置 ----------
 
+# Backend 选择: "ollama" (默认本地) 或 "minimax" (云端 OpenAI 兼容)
+BACKEND = os.environ.get("MINICODE_BACKEND", "ollama").lower()
+
+# Ollama 配置
 OLLAMA_BASE_URL = os.environ.get("MINICODE_OLLAMA_URL", "http://localhost:11434")
-MODEL_NAME = os.environ.get("MINICODE_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
+OLLAMA_MODEL = os.environ.get("MINICODE_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
+
+# MiniMax 配置 (OpenAI 兼容端点 — 见 README §backends)
+MINIMAX_BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
+MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
+
+# 兼容旧名: MINICODE_MODEL 在 minimax backend 下也允许 (优先级低于 MINIMAX_MODEL)
+if BACKEND == "minimax" and "MINIMAX_MODEL" not in os.environ:
+    MINIMAX_MODEL = os.environ.get("MINICODE_MODEL", MINIMAX_MODEL)
+
+# MODEL_NAME 是个老变量名, 留着供下游 print 兼容 — 实际选择在 load_model() 里
+MODEL_NAME = MINIMAX_MODEL if BACKEND == "minimax" else OLLAMA_MODEL
+
 REQUEST_TIMEOUT = int(os.environ.get("MINICODE_TIMEOUT", "300"))  # 秒, 首次加载模型可能慢
 # 流式输出开关. REPL 默认开 (体验), pytest 默认关 (确定性).
 # 设 MINICODE_STREAM=0 强制关.
@@ -1337,31 +1391,54 @@ def split_think(text: str) -> tuple[str, str]:
 # 模型加载 + 生成 (Ollama HTTP, OpenAI 兼容)
 # =================================================================
 
-@dataclass
-class OllamaClient:
-    """薄 HTTP 客户端 — 只用 stdlib, 不引 requests 依赖."""
-    base_url: str = OLLAMA_BASE_URL
-    model: str = MODEL_NAME
-    timeout: int = REQUEST_TIMEOUT
+class _OpenAICompatClient:
+    """OpenAI-兼容 HTTP 客户端基类 — Ollama 和 MiniMax 共享这套.
+
+    两者都暴露 `/v1/chat/completions`, 同样的 SSE 流式协议, 同样的 tool_calls 形态.
+    唯一差异: base_url, 认证 header (有/无), 错误消息措辞.
+
+    子类只需提供:
+      - provider_name (用在错误消息里)
+      - 构造时填 base_url, model, optional headers (auth)
+      - 可选 hint(): 连接失败时给用户的引导 (Ollama 是"is daemon running",
+        MiniMax 是"check API key & quota")
+    """
+
+    provider_name: str = "OpenAI-compat"
+
+    def __init__(
+        self, base_url: str, model: str, timeout: int = REQUEST_TIMEOUT,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        self.base_url = base_url
+        self.model = model
+        self.timeout = timeout
+        self.extra_headers = extra_headers or {}
+
+    def _hint_unreachable(self, reason: str) -> str:
+        """子类可覆盖, 给用户更针对性的引导."""
+        return f"Can't reach {self.provider_name} at {self.base_url} ({reason})"
+
+    def _build_headers(self, accept_sse: bool = False) -> dict[str, str]:
+        h = {"Content-Type": "application/json", **self.extra_headers}
+        if accept_sse:
+            h["Accept"] = "text/event-stream"
+        return h
 
     def _post_json(self, path: str, payload: dict) -> dict:
         url = f"{self.base_url.rstrip('/')}{path}"
         body = json.dumps(payload).encode("utf-8")
         req = urlrequest.Request(
-            url, data=body, method="POST",
-            headers={"Content-Type": "application/json"},
+            url, data=body, method="POST", headers=self._build_headers(),
         )
         try:
             with urlrequest.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Ollama HTTP {e.code}: {detail}") from e
+            raise RuntimeError(f"{self.provider_name} HTTP {e.code}: {detail}") from e
         except URLError as e:
-            raise RuntimeError(
-                f"Can't reach Ollama at {self.base_url}. "
-                f"Is the Ollama app running? ({e.reason})"
-            ) from e
+            raise RuntimeError(self._hint_unreachable(str(e.reason))) from e
 
     def chat(self, messages: list[dict], tools: list[dict] | None) -> dict:
         payload: dict[str, Any] = {
@@ -1377,19 +1454,18 @@ class OllamaClient:
         try:
             return resp["choices"][0]["message"]
         except (KeyError, IndexError) as e:
-            raise RuntimeError(f"Unexpected Ollama response shape: {resp}") from e
+            raise RuntimeError(f"Unexpected {self.provider_name} response shape: {resp}") from e
 
     def chat_stream(self, messages: list[dict], tools: list[dict] | None):
-        """流式版 chat — 按 SSE 协议逐行解析 Ollama 的增量 delta.
+        """流式版 chat — 按 SSE 协议逐行解析 OpenAI 兼容的增量 delta.
 
-        yield 出每个 delta 的 message 片段 (dict): 上层负责拼回完整 message.
+        yield 出每个 delta 的 message 片段 (dict): 上层 _StreamRenderer 负责拼回完整 message.
         典型 delta 形态:
           {"content": "hello "}            # 文本 token
           {"tool_calls": [{"index": 0, "id": "...", "function": {"name":"LS"}}]}
           {"tool_calls": [{"index": 0, "function": {"arguments": "{\\""}}]}
-          {"tool_calls": [{"index": 0, "function": {"arguments": "path"}}]}
-          ...
-        最后通常一行 [DONE] 结束.
+        Ollama 习惯把整个 tool_call 一次性塞进单 delta; MiniMax 应该会更细粒度
+        (是真流式), 但 reassembler 都能吃 — 一片也是拼, N 片也是拼.
         """
         payload: dict[str, Any] = {
             "model": self.model,
@@ -1404,25 +1480,19 @@ class OllamaClient:
         url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
         body = json.dumps(payload).encode("utf-8")
         req = urlrequest.Request(
-            url, data=body, method="POST",
-            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+            url, data=body, method="POST", headers=self._build_headers(accept_sse=True),
         )
         try:
             resp = urlrequest.urlopen(req, timeout=self.timeout)
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Ollama HTTP {e.code}: {detail}") from e
+            raise RuntimeError(f"{self.provider_name} HTTP {e.code}: {detail}") from e
         except URLError as e:
-            raise RuntimeError(
-                f"Can't reach Ollama at {self.base_url}. "
-                f"Is the Ollama app running? ({e.reason})"
-            ) from e
+            raise RuntimeError(self._hint_unreachable(str(e.reason))) from e
 
-        # 用 with 确保异常 / KeyboardInterrupt 时连接也能关掉
         with resp:
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                # SSE 格式: "data: {...}" 或空行 (心跳/分隔)
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
@@ -1431,8 +1501,7 @@ class OllamaClient:
                 try:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
-                    continue  # 容错: 偶发的格式不对就跳过, 不中断流
-                # OpenAI SSE 形态: choices[0].delta = {content?, tool_calls?, role?}
+                    continue
                 try:
                     delta = chunk["choices"][0].get("delta") or {}
                 except (KeyError, IndexError):
@@ -1441,10 +1510,61 @@ class OllamaClient:
                     yield delta
 
 
-def load_model() -> OllamaClient:
-    client = OllamaClient()
-    print(f"Using Ollama at {client.base_url}, model={client.model} "
-          f"(timeout={client.timeout}s)", file=sys.stderr)
+class OllamaClient(_OpenAICompatClient):
+    """Ollama 本地后端 — 无认证, 默认 localhost."""
+
+    provider_name = "Ollama"
+
+    def __init__(self, base_url: str = OLLAMA_BASE_URL, model: str = OLLAMA_MODEL,
+                 timeout: int = REQUEST_TIMEOUT) -> None:
+        super().__init__(base_url=base_url, model=model, timeout=timeout)
+
+    def _hint_unreachable(self, reason: str) -> str:
+        return (f"Can't reach Ollama at {self.base_url}. "
+                f"Is the Ollama app running? ({reason})")
+
+
+class MinimaxClient(_OpenAICompatClient):
+    """MiniMax 云端后端 — Bearer 认证, OpenAI-兼容端点."""
+
+    provider_name = "MiniMax"
+
+    def __init__(self, api_key: str, base_url: str = MINIMAX_BASE_URL,
+                 model: str = MINIMAX_MODEL, timeout: int = REQUEST_TIMEOUT) -> None:
+        if not api_key:
+            raise RuntimeError(
+                "MINIMAX_API_KEY is empty. Set it in .env (gitignored) or your shell env. "
+                "Get a key at https://platform.minimaxi.com/"
+            )
+        super().__init__(
+            base_url=base_url, model=model, timeout=timeout,
+            extra_headers={"Authorization": f"Bearer {api_key}"},
+        )
+
+    def _hint_unreachable(self, reason: str) -> str:
+        return (f"Can't reach MiniMax at {self.base_url}. "
+                f"Check network, key validity, and quota. ({reason})")
+
+
+# 类型别名: 上层只关心"有 chat/chat_stream 的客户端", 不关心是哪家
+LLMClient = _OpenAICompatClient
+
+
+def load_model() -> LLMClient:
+    """根据 MINICODE_BACKEND 环境变量构造客户端."""
+    if BACKEND == "minimax":
+        client = MinimaxClient(api_key=MINIMAX_API_KEY)
+    elif BACKEND == "ollama":
+        client = OllamaClient()
+    else:
+        raise RuntimeError(
+            f"Unknown MINICODE_BACKEND={BACKEND!r}. Use 'ollama' or 'minimax'."
+        )
+    print(
+        f"Using {client.provider_name} at {client.base_url}, "
+        f"model={client.model} (timeout={client.timeout}s)",
+        file=sys.stderr,
+    )
     return client
 
 
@@ -1552,9 +1672,9 @@ def _history_to_openai(history: list[Message]) -> list[dict]:
     return out
 
 
-def generate(client: OllamaClient, history: list[Message],
+def generate(client: LLMClient, history: list[Message],
              tool_schemas: list[dict]) -> dict:
-    """调用 Ollama 的 chat completion, 返回 assistant message dict.
+    """调用 LLM (Ollama / MiniMax) 的 chat completion, 返回 assistant message dict.
 
     返回形如:
       {"role": "assistant", "content": "...",
@@ -1681,7 +1801,7 @@ class ReActAgent:
 
     def __init__(
         self,
-        llm: OllamaClient,
+        llm: LLMClient,
         registry: ToolRegistry,
         system_prompt: str = SYSTEM,
     ) -> None:
@@ -1892,7 +2012,7 @@ HELP = """\
 
 def _print_banner(agent: ReActAgent, terminal: TerminalTool) -> None:
     print(f"{C.BOLD}{C.USER}{BANNER}{C.RESET}")
-    print(f"  {C.DIM}backend:{C.RESET} Ollama @ {agent.llm.base_url}")
+    print(f"  {C.DIM}backend:{C.RESET} {agent.llm.provider_name} @ {agent.llm.base_url}")
     print(f"  {C.DIM}model  :{C.RESET} {agent.llm.model}")
     print(f"  {C.DIM}cwd    :{C.RESET} {WORKDIR}")
     print(f"  {C.DIM}shell  :{C.RESET} {terminal.bash_exe or '(cmd.exe 回退)'}")
