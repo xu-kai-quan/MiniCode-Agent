@@ -2865,6 +2865,8 @@ def _print_banner(agent: ReActAgent, terminal: TerminalTool) -> None:
     print(f"  {C.DIM}shell  :{C.RESET} {terminal.bash_exe or '(cmd.exe 回退)'}")
     print(f"  {C.DIM}grep   :{C.RESET} {_RG_PATH or '(纯 Python 兜底, 装 ripgrep 更快)'}")
     print(f"  {C.DIM}tools  :{C.RESET} {C.ACTION}{', '.join(agent.registry.names())}{C.RESET}")
+    print(f"  {C.DIM}save   :{C.RESET} auto every {int(AUTOSAVE_MIN_INTERVAL)}s + on /exit/Ctrl-C → "
+          f"{SESSIONS_DIR / (AUTOSAVE_NAME + '.json')}")
     print(f"  {C.DIM}输入 /help 查看命令, /exit 退出{C.RESET}")
     print(f"{C.DIM}{'─' * 72}{C.RESET}")
 
