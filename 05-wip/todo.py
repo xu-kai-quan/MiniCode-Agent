@@ -75,8 +75,9 @@ BACKEND = os.environ.get("MINICODE_BACKEND", "ollama").lower()
 OLLAMA_BASE_URL = os.environ.get("MINICODE_OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("MINICODE_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
 
-# MiniMax 配置 (OpenAI 兼容端点 — 见 README §backends)
-MINIMAX_BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+# MiniMax 配置 (OpenAI 兼容端点 — 见 README §backends).
+# base_url 不要带 /v1 — client 内部拼 /v1/chat/completions, 跟 OllamaClient 一致.
+MINIMAX_BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com")
 MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 
