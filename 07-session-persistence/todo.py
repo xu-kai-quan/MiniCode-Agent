@@ -128,6 +128,16 @@ SESSIONS_DIR = Path(
     os.environ.get("MINICODE_SESSIONS_DIR", str(Path.home() / ".minicode" / "sessions"))
 )
 
+# auto-save 用的固定名字. 用户的 /save 拒绝这个名字 (保留名), 防互相覆盖.
+AUTOSAVE_NAME = "_autosave"
+
+# auto-save 触发时机:
+#  - 每 turn 结束后, 但限速 (至少 AUTOSAVE_MIN_INTERVAL 秒一次, 避免高频写盘)
+#  - Ctrl-C 中断时 (强制写, 不限速 — 这是最关键的触发点)
+#  - REPL 退出时 (强制写, 不限速)
+# 限速间隔: 30 秒. 长任务 30 秒/写一次, 进程崩溃顶多丢 30 秒进度.
+AUTOSAVE_MIN_INTERVAL = float(os.environ.get("MINICODE_AUTOSAVE_INTERVAL", "30"))
+
 # spawn_agent 创建 worktree 后写入 .git/info/exclude 的 patterns —
 # 排除子 agent 跑命令时常生成的"垃圾", 让 git diff 只显示真改动.
 # 注意: .git/info/exclude 是 worktree 局部的, 不污染主仓库的 .gitignore.
@@ -2635,13 +2645,18 @@ HELP = """\
 可用斜杠命令:
   /help              显示本帮助
   /exit              退出 (Ctrl-D / Ctrl-C 同效)
-  /clear             清空对话历史 (保留 system, todo 状态一并重置)
+  /clear             清空对话历史 (清空前先 auto-save 一份)
   /todos             显示当前 todo 列表
   /history           显示消息条数统计
   /save <name>       保存当前 session 到 ~/.minicode/sessions/<name>.json
-  /load <name>       加载已保存的 session (会清空当前 session)
+  /load <name>       加载已保存的 session (会替换当前 session)
   /sessions          列出所有已保存的 session
   /del <name>        删除一个已保存的 session
+
+auto-save: 退出 / Ctrl-C / /clear / 每 30 秒一次 (turn 结束后) 会自动存一份到
+  '_autosave' 这个特殊 slot. 想恢复就 /load _autosave. 启动时若发现有 _autosave
+  会打印提示 (但不自动 load — 决定权在你).
+
 其他任何非 / 开头的输入都会作为 user 消息送入 agent。
 """
 
@@ -2672,6 +2687,11 @@ def _cmd_save(agent: ReActAgent, name: str) -> None:
     err = _validate_session_name(name)
     if err:
         print(f"{C.ERR}error: {err}{C.RESET}")
+        return
+    if name == AUTOSAVE_NAME:
+        # 保留名 — 防用户手动 /save 跟 auto-save 互相覆盖
+        print(f"{C.ERR}error: '{AUTOSAVE_NAME}' is a reserved name (auto-save uses it). "
+              f"Pick a different name.{C.RESET}")
         return
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     target = _session_file(name)
@@ -2758,6 +2778,74 @@ def _cmd_del(name: str) -> None:
         print(f"{C.ERR}delete failed: {e}{C.RESET}")
 
 
+# ----- auto-save 状态: REPL 进程级单例, 不进 Session (Session 持久化的不是元状态) -----
+# 上次 auto-save 的时间戳 (monotonic 秒). None 表示从没触发过.
+_LAST_AUTOSAVE_AT: float | None = None
+
+
+def _autosave(agent: ReActAgent, *, force: bool = False) -> None:
+    """auto-save 当前 session 到 ~/.minicode/sessions/_autosave.json.
+
+    限速: force=False 时, 距离上次 auto-save 不到 AUTOSAVE_MIN_INTERVAL 秒则跳过.
+    force=True 用于退出 / Ctrl-C 等关键时刻, 不限速.
+
+    跳过条件 (静默):
+    - history 长度 ≤ 1 (只有 system message, 没干啥)
+    - session 是 sub-agent (不该被独立保存)
+    - 距离上次 auto-save 不到限速间隔 (除非 force)
+    - 写盘失败 (打印 warn 但不抛, auto-save 不该崩 REPL)
+    """
+    global _LAST_AUTOSAVE_AT
+    sess = agent.session
+
+    # 跳过不该存的
+    if sess.is_subagent:
+        return
+    if len(sess.history) <= 1:
+        return  # 没实质内容
+
+    # 限速: 非 force 时检查间隔
+    import time as _t
+    now = _t.monotonic()
+    if not force and _LAST_AUTOSAVE_AT is not None:
+        if now - _LAST_AUTOSAVE_AT < AUTOSAVE_MIN_INTERVAL:
+            return
+
+    # 写盘
+    target = _session_file(AUTOSAVE_NAME)
+    try:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(sess.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        _LAST_AUTOSAVE_AT = now
+    except OSError as e:
+        # 不让 auto-save 失败拖垮 REPL — 打印 warn 走人
+        print(f"{C.WARN}(auto-save failed: {e}){C.RESET}")
+
+
+def _check_and_announce_autosave() -> None:
+    """REPL 启动时检测是否有 auto-save 文件, 有就打印提示让用户决定要不要 /load."""
+    target = _session_file(AUTOSAVE_NAME)
+    if not target.is_file():
+        return
+    try:
+        import time as _t
+        st = target.stat()
+        age = _t.time() - st.st_mtime
+        # 也快速读一下 size + 大致内容 (避免装作有但其实是 0 字节坏文件)
+        if st.st_size < 50:
+            return  # 太小不像有效 session
+    except OSError:
+        return
+    print(
+        f"{C.WARN}found auto-saved session from {_fmt_age(age)} ago "
+        f"({st.st_size} bytes). Type {C.BOLD}/load _autosave{C.RESET}{C.WARN} "
+        f"to resume.{C.RESET}"
+    )
+
+
 def _fmt_age(seconds: float) -> str:
     """把秒数格式化成人类可读的"X 分钟前"."""
     if seconds < 60:
@@ -2791,11 +2879,15 @@ def repl() -> None:
     agent = ReActAgent(llm, registry)
 
     _print_banner(agent, terminal)
+    # v7: 启动时检查有没有 auto-save 文件, 提示用户可以 /load _autosave 续上次
+    _check_and_announce_autosave()
 
     while True:
         try:
             line = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
+            # v7: 退出前强制 auto-save (force=True 跳过限速)
+            _autosave(agent, force=True)
             print("\nbye.")
             return
 
@@ -2809,14 +2901,18 @@ def repl() -> None:
             args = parts[1].strip() if len(parts) > 1 else ""
 
             if cmd in ("exit", "quit", "q"):
+                # v7: 显式 /exit 也 auto-save
+                _autosave(agent, force=True)
                 print("bye.")
                 return
             if cmd == "help":
                 print(HELP)
                 continue
             if cmd == "clear":
+                # 清空之前先 auto-save 一份 — 万一用户后悔, 还能 /load _autosave
+                _autosave(agent, force=True)
                 agent.new_session()
-                print("(history cleared)")
+                print("(history cleared, prior session auto-saved to _autosave)")
                 continue
             if cmd == "todos":
                 print(agent.session.todo.render())
@@ -2847,6 +2943,11 @@ def repl() -> None:
             agent.run(line)
         except KeyboardInterrupt:
             print("\n(turn interrupted)")
+            # v7: Ctrl-C 是丢数据高发场景 — 立即 force auto-save
+            _autosave(agent, force=True)
+        else:
+            # v7: 正常 turn 结束后 auto-save (限速, 30 秒内多 turn 只写一次)
+            _autosave(agent, force=False)
 
 
 # =================================================================

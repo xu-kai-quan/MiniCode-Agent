@@ -1073,3 +1073,165 @@ class TestSessionPersistence:
         assert M._validate_session_name("a b") is not None  # 空格
         assert M._validate_session_name("a.json") is not None  # 不该带扩展
         assert M._validate_session_name("x" * 100) is not None  # 太长
+
+
+# =================================================================
+# auto-save (v7 第二轮新增) — 限速 / force / 保留名 / 真文件 round-trip
+# =================================================================
+
+class TestAutoSave:
+    @pytest.fixture
+    def auto_workspace(self, tmp_path, monkeypatch):
+        """每个测试一个干净的 SESSIONS_DIR + 重置 _LAST_AUTOSAVE_AT."""
+        sd = tmp_path / "sessions"
+        monkeypatch.setattr(M, "SESSIONS_DIR", sd)
+        monkeypatch.setattr(M, "_LAST_AUTOSAVE_AT", None)
+        return sd
+
+    def _make_agent(self, tmp_path, monkeypatch):
+        """造一个 ReActAgent 用于测试. fake LLM 不会被调用."""
+        monkeypatch.setattr(M, "WORKDIR", tmp_path.resolve())
+        terminal = M.TerminalTool(tmp_path.resolve())
+        registry = M.build_default_registry(terminal)
+        return M.ReActAgent(llm=None, registry=registry, system_prompt="test")
+
+    def test_autosave_skips_empty_session(self, tmp_path, monkeypatch, auto_workspace):
+        """history 只有 system message 时不该写盘."""
+        agent = self._make_agent(tmp_path, monkeypatch)
+        # 此时 history = [system message] 长度 1
+        M._autosave(agent, force=True)
+        autosave_file = auto_workspace / f"{M.AUTOSAVE_NAME}.json"
+        assert not autosave_file.exists(), "empty session should not be auto-saved"
+
+    def test_autosave_writes_when_history_exists(self, tmp_path, monkeypatch, auto_workspace):
+        """history 有内容时, force=True 写盘."""
+        agent = self._make_agent(tmp_path, monkeypatch)
+        agent.session.history.append(M.Message.user("hello"))
+        agent.session.history.append(M.Message.assistant("hi back"))
+        M._autosave(agent, force=True)
+        autosave_file = auto_workspace / f"{M.AUTOSAVE_NAME}.json"
+        assert autosave_file.exists()
+        # 文件内容是合法 JSON 且含我们写的消息
+        d = __import__("json").loads(autosave_file.read_text(encoding="utf-8"))
+        assert d["version"] == 1
+        contents = [m.get("content", "") for m in d["history"]]
+        assert "hello" in contents
+        assert "hi back" in contents
+
+    def test_autosave_skips_subagent(self, tmp_path, monkeypatch, auto_workspace):
+        """is_subagent=True 的 session 不该被 auto-save."""
+        agent = self._make_agent(tmp_path, monkeypatch)
+        # 强制把 session 改成子 agent
+        agent.session.is_subagent = True
+        agent.session.history.append(M.Message.user("sub task"))
+        M._autosave(agent, force=True)
+        autosave_file = auto_workspace / f"{M.AUTOSAVE_NAME}.json"
+        assert not autosave_file.exists()
+
+    def test_autosave_rate_limited(self, tmp_path, monkeypatch, auto_workspace):
+        """两次连续 auto-save (force=False) 间隔 < AUTOSAVE_MIN_INTERVAL 应当跳过第二次."""
+        agent = self._make_agent(tmp_path, monkeypatch)
+        agent.session.history.append(M.Message.user("first"))
+        # 第一次写
+        M._autosave(agent, force=False)
+        autosave_file = auto_workspace / f"{M.AUTOSAVE_NAME}.json"
+        assert autosave_file.exists()
+        first_mtime = autosave_file.stat().st_mtime_ns
+
+        # 改 history 但立即再 autosave (无 force) — 应该被限速跳过
+        agent.session.history.append(M.Message.assistant("more"))
+        import time as _time
+        _time.sleep(0.05)  # 让 mtime 有机会变 (如果真写的话)
+        M._autosave(agent, force=False)
+        # mtime 应该没变 (没真写)
+        assert autosave_file.stat().st_mtime_ns == first_mtime
+
+    def test_autosave_force_bypasses_rate_limit(self, tmp_path, monkeypatch, auto_workspace):
+        """force=True 应当无视限速."""
+        agent = self._make_agent(tmp_path, monkeypatch)
+        agent.session.history.append(M.Message.user("first"))
+        M._autosave(agent, force=False)
+        autosave_file = auto_workspace / f"{M.AUTOSAVE_NAME}.json"
+        first_mtime = autosave_file.stat().st_mtime_ns
+
+        agent.session.history.append(M.Message.assistant("more"))
+        import time as _time
+        _time.sleep(0.05)
+        M._autosave(agent, force=True)  # force 跳过限速
+        # 应该真写了, mtime 变了
+        assert autosave_file.stat().st_mtime_ns != first_mtime
+
+    def test_save_rejects_reserved_autosave_name(self, tmp_path, monkeypatch, auto_workspace, capsys):
+        """用户 /save _autosave 应当被拒, 不会污染 auto-save slot."""
+        agent = self._make_agent(tmp_path, monkeypatch)
+        agent.session.history.append(M.Message.user("real session"))
+
+        M._cmd_save(agent, M.AUTOSAVE_NAME)
+        captured = capsys.readouterr()
+        # 应当打印 reserved 错误
+        assert "reserved" in captured.out.lower() or "reserved" in captured.err.lower()
+        # 文件不该存在
+        autosave_file = auto_workspace / f"{M.AUTOSAVE_NAME}.json"
+        assert not autosave_file.exists()
+
+    def test_full_round_trip_via_real_file(self, tmp_path, monkeypatch, auto_workspace):
+        """端到端: agent 跑了一些 turn → auto-save → 新 agent /load → history 完全一致.
+
+        这是 v7 'session 真能跨进程恢复'的 ground-truth 测试.
+        模拟"REPL → Ctrl-C → 重启 → /load _autosave → 继续"的全流程.
+        """
+        # 第一阶段: 模拟 REPL 跑了几轮, 然后 force-save (相当于 Ctrl-C 触发 auto-save)
+        agent1 = self._make_agent(tmp_path, monkeypatch)
+        agent1.session.history.append(M.Message.user("explain X"))
+        agent1.session.history.append(M.Message.assistant(
+            "X is...", tool_calls=[{"id": "c1", "type": "function",
+                                     "function": {"name": "Read", "arguments": '{"path":"foo.py"}'}}]
+        ))
+        agent1.session.history.append(M.Message.tool("foo.py contents", tool_call_id="c1"))
+        agent1.session.todo.items = [
+            {"id": "1", "text": "explain X", "status": "completed"},
+            {"id": "2", "text": "explain Y", "status": "in_progress"},
+        ]
+        agent1.session.prompt_tokens_total = 1500
+        agent1.session.completion_tokens_total = 300
+        M._autosave(agent1, force=True)
+        autosave_file = auto_workspace / f"{M.AUTOSAVE_NAME}.json"
+        assert autosave_file.exists()
+
+        # 第二阶段: 模拟新进程启动 — 创建全新 agent, /load _autosave
+        # (实际 REPL 走 _cmd_load, 我们直接调它确认逻辑链路)
+        agent2 = self._make_agent(tmp_path, monkeypatch)
+        # 新 agent 的 history 只有 system, 跟 agent1 不同
+        assert len(agent2.session.history) == 1
+        assert agent2.session.completion_tokens_total == 0
+
+        # 调 /load
+        import io as _io, sys as _sys
+        old_stdout = _sys.stdout
+        _sys.stdout = _io.StringIO()
+        try:
+            M._cmd_load(agent2, M.AUTOSAVE_NAME)
+        finally:
+            _sys.stdout = old_stdout
+
+        # 验证: agent2 的 session 现在跟 agent1 当时一致
+        assert len(agent2.session.history) == 4, "history not restored"
+        # 检查内容字段
+        msgs = [(m.role, m.content[:30]) for m in agent2.session.history]
+        assert ("user", "explain X") in msgs
+        assert ("tool", "foo.py contents") in msgs
+        # tool_calls 也要恢复
+        assistant_msg = agent2.session.history[2]
+        assert assistant_msg.tool_calls is not None
+        assert assistant_msg.tool_calls[0]["function"]["name"] == "Read"
+        # tool message 的 tool_call_id 也要保留
+        tool_msg = agent2.session.history[3]
+        assert tool_msg.tool_call_id == "c1"
+        # todos 也要恢复
+        assert len(agent2.session.todo.items) == 2
+        assert agent2.session.todo.items[1]["status"] == "in_progress"
+        # token 累计要保留
+        assert agent2.session.prompt_tokens_total == 1500
+        assert agent2.session.completion_tokens_total == 300
+        # read_cache 必须是空的 (不持久化)
+        assert agent2.session.read_cache._entries == {}
