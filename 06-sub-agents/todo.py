@@ -158,14 +158,47 @@ SYSTEM = textwrap.dedent(f"""\
     Call apply_patch. Want to run a shell command? Call bash. Don't print
     them.
 
-    SUB-AGENT (spawn_agent): use this ONLY when you want to TRY something
-    without polluting this workspace — e.g. "apply this experimental diff
-    and check if tests pass". The sub-agent runs in an isolated git
-    worktree (a temp checkout of the same commit). It returns a summary
-    plus a unified diff of what it changed. You can then choose to apply
-    that diff to the main workspace via apply_patch, or discard it.
-    Don't use spawn_agent for normal multi-step tasks — todo + plain
-    tool calls are cheaper and simpler.
+    SUB-AGENT (spawn_agent) — MANDATORY for exploratory changes:
+
+    When the user asks you to TRY a change to see what happens, you MUST
+    use spawn_agent. Do NOT directly edit_file/write_file/apply_patch the
+    main workspace for an exploratory request. The user explicitly wants
+    to see the diff and decide whether to apply it.
+
+    Trigger words that mean "use spawn_agent":
+      Chinese: "试一下", "试试", "试一试", "试着", "试验", "看看能不能",
+               "看通不通过", "测一下", "尝试"
+      English: "try", "experiment with", "see if", "check whether",
+               "verify if", "test if X works after Y"
+
+    Combined signal: trigger word + change/verification request
+    (e.g. "试一下把 X 改成 Y, 跑测试" / "try modifying X to Y and run tests").
+
+    The sub-agent runs in an isolated git worktree (temp checkout of HEAD).
+    It returns a summary plus a unified diff. You then report to the user
+    and ask whether to apply the diff to the main workspace via apply_patch.
+
+    EXAMPLE — correct sub-agent use:
+      user: "试一下把 todo.py 第 1 行改成 hhhhhhhh, 跑 pytest 看通不通过"
+      assistant: [tool_call: spawn_agent(task="In foo.py replace line 1
+                  with 'hhhhhhhh' (use edit_file), then run pytest and
+                  report PASS/FAIL")]
+      → sub-agent runs in /tmp/minicode-sub-XXX, returns diff + outcome
+      → you tell user the result and ask "apply this diff to your
+         workspace?" (do NOT auto-apply)
+      → if user says yes: apply_patch(patch=<sub_agent's diff>)
+
+    EXAMPLE — DO NOT use sub-agent (normal task):
+      user: "把 hello.py 改成带类型提示的版本"
+      assistant: [direct: Read(hello.py), then edit_file or apply_patch]
+      (No "试" / "try" — user wants the change committed directly.)
+
+    When NOT to use sub-agent: user wants the change committed (no
+    "试/try"), pure read/explore tasks (Read/Grep/LS suffice), or
+    multi-step planning tasks (use todo).
+
+    Skip the mandate when user explicitly says "直接改" / "no sandbox" /
+    "in main" — that's an opt-out signal.
 """).strip()
 
 # 子 agent 的 SYSTEM — 跟主 agent 完全不同. 强调:
@@ -1634,20 +1667,27 @@ def build_default_registry(terminal: TerminalTool, session: Session | None = Non
     reg.register(Tool.from_function(
         tool_spawn_agent, name="spawn_agent",
         description=(
-            "Spawn a sub-agent in an isolated git worktree to TRY a change "
-            "without polluting the main workspace. Use this when you want "
-            "to apply an experimental diff and check if tests pass, or to "
-            "explore a refactor that you might want to discard. The sub-"
-            "agent returns a summary plus a unified diff of what it changed. "
-            "You can then apply that diff to the main workspace via "
-            "apply_patch, or discard it. Requires the main workspace to be "
-            "a git repository. Do NOT use spawn_agent for normal multi-step "
-            "tasks — todo + plain tool calls are cheaper and simpler."
+            "*** USE THIS for ANY 'try / 试一下 / 试试 / 试着 / experiment / "
+            "see if' request from the user. *** This is the ONLY safe way to "
+            "apply experimental changes — it runs in an isolated git worktree, "
+            "so the main workspace is untouched no matter what happens. "
+            "Returns a summary + unified diff; you then ask the user whether "
+            "to apply the diff via apply_patch.\n"
+            "\n"
+            "DO NOT call edit_file/write_file/apply_patch directly on the main "
+            "workspace when the user's request includes 'try/试' wording — "
+            "that defeats the purpose. The user wants to REVIEW before "
+            "committing.\n"
+            "\n"
+            "Requires the main workspace to be a git repository. Don't use "
+            "spawn_agent for committed (non-exploratory) tasks — those want "
+            "direct edit_file/apply_patch + optional todo planning."
         ),
         param_docs={
-            "task": "Bounded task description for the sub-agent. Be specific about "
-                    "what to change and what to verify (e.g. 'apply this diff to "
-                    "foo.py: ... then run pytest tests/ and report PASS/FAIL').",
+            "task": "Bounded task for the sub-agent. State BOTH the change AND "
+                    "the verification step (e.g. 'replace line 1 of foo.py with "
+                    "X using edit_file, then run pytest tests/ and report PASS/"
+                    "FAIL with the failing test names if any').",
         },
     ))
 
