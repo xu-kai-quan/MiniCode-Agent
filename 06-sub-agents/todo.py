@@ -121,6 +121,27 @@ SUB_AGENT_TIMEOUT = int(os.environ.get("MINICODE_SUB_TIMEOUT", "300"))
 # 真 diff 完整保留在 data["diff"] 里, 这里只截 text 显示部分.
 SUB_AGENT_DIFF_MAX_CHARS = int(os.environ.get("MINICODE_SUB_DIFF_MAX", "4000"))
 
+# spawn_agent 创建 worktree 后写入 .git/info/exclude 的 patterns —
+# 排除子 agent 跑命令时常生成的"垃圾", 让 git diff 只显示真改动.
+# 注意: .git/info/exclude 是 worktree 局部的, 不污染主仓库的 .gitignore.
+_WORKTREE_EXCLUDE_PATTERNS = [
+    "__pycache__/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    ".DS_Store",
+    "node_modules/",
+    ".venv/",
+    "venv/",
+    # .env 在主 repo 应当已经在 .gitignore 里, 但 worktree 这里再加一层
+    # 双保险 — 防止 spawn 期间 .env 被列入 diff
+    ".env",
+    ".env.local",
+]
+
 WORKDIR = Path.cwd().resolve()
 SYSTEM = textwrap.dedent(f"""\
     You are a coding agent.
@@ -1369,13 +1390,34 @@ _SPAWN_LLM: "LLMClient | None" = None
 def _git_worktree_create(main_workdir: Path) -> Path:
     """在临时目录创建 main_workdir HEAD 的 worktree. 返回 worktree 路径.
 
-    要求 main_workdir 是 git repo (有 .git). 否则抛 RuntimeError.
+    要求 main_workdir 是 git repo (有 .git 且至少一个 commit). 否则抛 RuntimeError
+    并附带可操作的引导 (含 .gitignore 模板防止 .env 被 commit).
+
+    创建成功后立刻写 worktree 局部的 .git/info/exclude, 排除常见 build 垃圾,
+    让后续 git diff 只显示真改动.
     """
     if not (main_workdir / ".git").exists():
-        # 也可能是 .git 文件 (worktree 嵌套), 但顶层 repo 一定有这个
+        # 升级为可操作错误 — 教用户怎么做, 而不是只说"missing .git"
+        # 关键: 引导里的 git init 步骤必须先建 .gitignore 排掉 .env, 否则
+        # 模型按错误消息照做时会把密钥 commit 进根 commit (上次实测的真坑).
+        gitignore_template = "\n  ".join(_WORKTREE_EXCLUDE_PATTERNS)
         raise RuntimeError(
-            f"spawn_agent requires {main_workdir} to be a git repository "
-            f"(missing .git). Run `git init` first."
+            f"spawn_agent requires {main_workdir} to be a git repository.\n"
+            f"\n"
+            f"To enable spawn_agent here, run THESE EXACT COMMANDS (the order matters — "
+            f".gitignore MUST exist before `git add .` so secrets don't get committed):\n"
+            f"\n"
+            f"  cd {main_workdir}\n"
+            f"  git init\n"
+            f"  cat > .gitignore << 'EOF'\n"
+            f"  {gitignore_template}\n"
+            f"  EOF\n"
+            f"  git add .\n"
+            f"  git commit -m 'init for minicode'\n"
+            f"\n"
+            f"WARNING: do NOT skip the .gitignore step. Without it, `git add .` "
+            f"will stage .env (with your API keys) and __pycache__/*.pyc into the "
+            f"root commit. Once committed, secrets are hard to scrub."
         )
     sub_dir = Path(tempfile.mkdtemp(prefix="minicode-sub-"))
     # git worktree add <path> HEAD: 在 path checkout 当前 HEAD
@@ -1392,21 +1434,57 @@ def _git_worktree_create(main_workdir: Path) -> Path:
         except OSError:
             pass
         raise RuntimeError(f"git worktree add failed: {(r.stderr or '').strip()}")
+
+    # 创建成功 → 在 worktree 根写 .gitignore, 排除常见 build 垃圾.
+    # 关键发现 (实测): worktree 的 .git/info/exclude 不被尊重 (git worktree
+    # 的 gitdir 下 info/ 不在 git 的 read 路径里). 必须用 worktree 根的
+    # .gitignore 文件. 文件本身会被 ls-files 列出来 — 我们在排除列表里
+    # 也把 .gitignore 自己排掉, 让它从 diff 里消失.
+    try:
+        gitignore_path = sub_dir / ".gitignore"
+        # 如果原本 worktree 已经有 .gitignore (因为 commit 里就有), 不覆盖,
+        # 改成追加我们的额外条目. 否则新建.
+        existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+        if "# minicode spawn_agent" not in existing:
+            addition_lines = ["# minicode spawn_agent: ignore build/cache/secrets in diff"]
+            addition_lines.extend(_WORKTREE_EXCLUDE_PATTERNS)
+            # 把 .gitignore 文件自己也排掉, 避免它出现在 diff 里
+            addition_lines.append(".gitignore")
+            addition = "\n" + "\n".join(addition_lines) + "\n"
+            gitignore_path.write_text(existing + addition, encoding="utf-8")
+    except OSError:
+        # 写失败不致命 — diff 会带噪音, 但 worktree 仍可用
+        pass
+
     return sub_dir
 
 
 def _git_worktree_diff(worktree: Path) -> str:
     """跑 git diff HEAD 拿到子 agent 的全部改动 (含 untracked 新建文件).
 
-    必须先 git add -N .  让新文件进入 git 视野 (intent-to-add), 这样 git diff
-    就能看到新文件的内容. 直接 git diff HEAD 看不到 untracked.
+    要让新文件出现在 diff 里, 必须 git add -N (intent-to-add). 但 `git add -N .`
+    会绕过 .gitignore + .git/info/exclude — 把所有 untracked 都强制加进去.
+    我们要的是只加"非 ignored 的 untracked", 所以先用 ls-files 拿这个列表
+    (它尊重 ignore 规则), 再逐个 add -N.
     """
-    # intent-to-add: 把所有 untracked 文件加为"intent" 但不真 stage. 让 diff 能显示.
-    subprocess.run(
-        ["git", "add", "-N", "."],
+    # 1) 列出 untracked 但 NOT ignored 的文件 (尊重 .gitignore + .git/info/exclude)
+    ls = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
         cwd=str(worktree), capture_output=True, text=True, timeout=30,
         encoding="utf-8", errors="replace",
     )
+    if ls.returncode == 0:
+        files_to_add = [f for f in (ls.stdout or "").splitlines() if f.strip()]
+        # 2) 逐个 git add -N (即使是 ignored 文件路径也不会被 add 因为 -N 还是会
+        #    检查 ignore 规则? 其实不会 — 显式 add 会绕过. 但我们已经过滤了 ignored,
+        #    所以这里安全)
+        if files_to_add:
+            subprocess.run(
+                ["git", "add", "-N", "--"] + files_to_add,
+                cwd=str(worktree), capture_output=True, text=True, timeout=30,
+                encoding="utf-8", errors="replace",
+            )
+    # 3) git diff HEAD — 已 tracked 文件的改动 + 新加为 intent-to-add 的内容
     r = subprocess.run(
         ["git", "diff", "HEAD"],
         cwd=str(worktree), capture_output=True, text=True, timeout=30,

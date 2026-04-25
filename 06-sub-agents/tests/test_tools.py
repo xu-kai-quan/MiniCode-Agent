@@ -899,3 +899,40 @@ class TestSpawnAgent:
         sub_in, sub_out = r.data["sub_tokens"]
         assert main_session.prompt_tokens_total - before_in == sub_in
         assert main_session.completion_tokens_total - before_out == sub_out
+
+    def test_diff_excludes_pyc_and_pycache(self, monkeypatch, git_workspace):
+        """子 agent 写 *.pyc 和 __pycache__/ → spawn_agent 返回 diff 不该包含它们."""
+        # 子 agent 脚本: 写一个 fake .pyc + 一个 .pytest_cache 文件 + 一个真改动 (real.txt)
+        fake = _FakeSubAgentLLM([
+            ("write_file", {"path": "real.txt", "content": "real change\n"}),
+            ("write_file", {"path": "__pycache__/foo.cpython-312.pyc", "content": "fake bytecode\n"}),
+            ("write_file", {"path": ".pytest_cache/CACHEDIR.TAG", "content": "Signature: ...\n"}),
+        ])
+        monkeypatch.setattr(M, "_SPAWN_LLM", fake)
+        monkeypatch.setattr(M, "USE_STREAM", False)
+
+        terminal = M.TerminalTool(git_workspace)
+        registry = M.build_default_registry(terminal)
+        r = registry.dispatch("spawn_agent", {"task": "make changes including pyc and pycache"})
+
+        assert r.status == "success", f"got error: {r.text}"
+        diff = r.data["diff"]
+        # 真改动应该在 diff 里
+        assert "real.txt" in diff, "real change should appear in diff"
+        # 但 .pyc / __pycache__ / .pytest_cache 不应该
+        assert "__pycache__" not in diff, f"__pycache__ should be excluded:\n{diff}"
+        assert ".pyc" not in diff, f".pyc files should be excluded:\n{diff}"
+        assert ".pytest_cache" not in diff, f".pytest_cache should be excluded:\n{diff}"
+
+    def test_error_message_includes_gitignore_template(self, monkeypatch, registry, workspace):
+        """non-git workspace 的错误消息应当含 .gitignore 安全引导."""
+        monkeypatch.setattr(M, "_SPAWN_LLM", _FakeSubAgentLLM([]))
+        r = registry.dispatch("spawn_agent", {"task": "anything"})
+        assert r.status == "error"
+        assert r.data["code"] == "WORKTREE_FAILED"
+        msg = r.data["message"]
+        # 错误消息应当: (a) 教用户跑 git init, (b) 含 .gitignore 模板, (c) 警告 .env 风险
+        assert "git init" in msg, "error msg should suggest git init"
+        assert ".gitignore" in msg, "error msg should include .gitignore step"
+        assert ".env" in msg, "error msg should warn about .env"
+        assert "__pycache__" in msg or "pyc" in msg, "error msg should mention build artifacts"
