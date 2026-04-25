@@ -78,13 +78,23 @@ SYSTEM = textwrap.dedent("""\
     content that was supposed to be a tool argument — a unified diff IS
     the `patch` argument of the `apply_patch` tool, not a substitute for
     calling it;
-    (c) any other visible text representation of a tool name + arguments.
+    (c) a ```bash, ```sh, or ```shell code block containing a command
+    you intend to run — that command IS the `command` argument of the
+    `bash` tool. Putting it in a code block does not execute it;
+    (d) any other visible text representation of a tool name + arguments.
+
+    The distinction that matters: are you trying to RUN something or
+    SHOW something? If RUN — call the tool. Code blocks in your reply
+    only count as "showing example code to the user" (e.g. answering
+    "how would I write this in Python?"). Code blocks NEVER trigger
+    execution — there is no other path to action besides tool_calls.
+
     If your message contains tool-call content as visible text, the
     system will treat it as a final reply, no tool will run, and the
-    task will stall. Text is for talking to the user; tool_calls are
-    for doing work. In particular: if you have a unified diff ready,
-    CALL `apply_patch` with that diff as the `patch` argument. Do not
-    print the diff.
+    task will stall. In particular:
+    - Have a unified diff ready? CALL `apply_patch` with it as `patch`.
+    - Want to run a shell command? CALL `bash` with it as `command`.
+    Do not print the diff or the command. Call the tool.
 """).strip()
 MAX_ROUNDS = 20
 MAX_NEW_TOKENS = 4096
@@ -358,6 +368,9 @@ class Session:
     todo: TodoManager = field(default_factory=TodoManager)
     read_cache: ReadCache = field(default_factory=ReadCache)
     rounds_since_todo: int = 0
+    # 连续多少轮 "无 tool_call 但 visible 里有疑似工具调用代码块" — 干预计数器.
+    # 触达 CODEBLOCK_NAG_LIMIT (在 ReActAgent 上) 后 hard DONE, 防死循环.
+    codeblock_nag_count: int = 0
 
     @classmethod
     def new(cls, system_prompt: str) -> "Session":
@@ -1258,6 +1271,30 @@ def build_default_registry(terminal: TerminalTool, session: Session | None = Non
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
+# 检测"模型用代码块伪装工具调用"的语言列表. 这 6 个 lang 的代码块在 agent 场景下
+# 几乎只有"想绕过 tool_calls" 一种解释 — 用户不会问"教我写 diff/patch/json".
+# 故意不含 python/js/go/c++/sql 等 — 那些在"展示代码示例"场景下太常见, 误伤率高.
+_DODGED_TOOL_BLOCK_RE = re.compile(
+    r"```(?:bash|sh|shell|diff|patch|json)\b",
+    re.IGNORECASE,
+)
+
+_CODEBLOCK_REMINDER = (
+    "<reminder>Your last reply contained a ```bash/```sh/```diff/```patch/```json "
+    "code block, but no structured tool_call. The system does not execute code "
+    "blocks — only tool_calls reach the disk. If you intended to RUN that "
+    "content, call the corresponding tool now (`bash` for shell, `apply_patch` "
+    "for diffs). If you only meant to SHOW example code to the user, ignore "
+    "this reminder and reply normally without any of those code blocks.</reminder>"
+)
+
+
+def looks_like_dodged_tool_call(text: str) -> bool:
+    """模型在 visible 里写了 ```bash/```diff 等代码块 — 大概率是想绕过 tool_calls."""
+    if not text:
+        return False
+    return bool(_DODGED_TOOL_BLOCK_RE.search(text))
+
 
 def split_think(text: str) -> tuple[str, str]:
     """返回 (think, visible). think 仅供日志; visible 是真正放回历史的."""
@@ -1611,6 +1648,9 @@ def _parse_tool_arguments(raw: Any) -> dict:
 
 class ReActAgent:
     NAG_THRESHOLD = 3
+    # 系统层兜底: 模型连续这么多轮"用代码块伪装工具调用", 就硬退出 — 防止
+    # SYSTEM 禁令被绕过后陷入 reminder 死循环.
+    CODEBLOCK_NAG_LIMIT = 2
 
     def __init__(
         self,
@@ -1749,11 +1789,35 @@ class ReActAgent:
                     _box(f"Observation {i} → data (日志面板, 不喂模型)",
                          _fmt_data(obs.data), color=C.DATA)
 
+            sess = self.session
             if not res.actions:
+                # 系统层兜底: 无 tool_call + visible 里有 ```bash/```diff 等代码块,
+                # 八成是模型用文本伪装工具调用 (SYSTEM 已禁但 7B 偶尔嘴硬).
+                # 注入提醒, 给一次重做的机会; 连续 CODEBLOCK_NAG_LIMIT 次硬退出.
+                if looks_like_dodged_tool_call(res.visible):
+                    sess.codeblock_nag_count += 1
+                    if sess.codeblock_nag_count > self.CODEBLOCK_NAG_LIMIT:
+                        _box(
+                            f"⛔ GAVE UP (模型连续 {self.CODEBLOCK_NAG_LIMIT}+ 轮"
+                            f"用代码块代替 tool_call, 硬退出)",
+                            "", char="═", color=C.WARN,
+                        )
+                        return
+                    _box(
+                        f"⚠️  CODEBLOCK NAG ({sess.codeblock_nag_count}"
+                        f"/{self.CODEBLOCK_NAG_LIMIT})",
+                        "检测到 ```bash/```diff 等代码块但无 tool_call, 注入提醒",
+                        color=C.WARN,
+                    )
+                    self.history.append(Message.user(_CODEBLOCK_REMINDER))
+                    continue  # 跳过 DONE, 进下一轮重试
+                # 干净结束 — 重置 nag 计数器, 下次任务从 0 开始
+                sess.codeblock_nag_count = 0
                 _box("✅ DONE (无工具调用, 本轮结束)", "", char="═", color=C.DONE)
                 return
 
-            sess = self.session
+            # 有 tool_call 走正常路径 — 也算"模型回到 tool_calls 协议", 重置 nag 计数器
+            sess.codeblock_nag_count = 0
             sess.rounds_since_todo = 0 if res.used_todo else sess.rounds_since_todo + 1
             print(f"{C.META}→ [3] rounds_since_todo = {sess.rounds_since_todo}"
                   f"{'  (本轮调用了 todo, 已重置)' if res.used_todo else ''}{C.RESET}")
