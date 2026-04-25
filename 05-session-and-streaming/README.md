@@ -1,471 +1,736 @@
-# 05-session-and-streaming — v5 迭代起点 (派生自 04-structured-tool-calls)
-
-> 这一份从 04 派生, 持续叠加新能力. v5 主题逐渐成形 — 优先做"能力宽度":
-> Session 状态管理、流式输出、云端后端、token 成本可见. 等 v5 主题完全
-> 收敛后会重命名为 `05-<topic>` (类似 04 从 atomic-tools 改名 structured-tool-calls).
-
-## v5 相对 v4 的新增能力
-
-| 能力 | 说明 |
-|---|---|
-| **Session 状态管理** | history / todo / read_cache / 计数器统一进 `Session` 对象, 删掉模块级 TODO 全局变量, 多 agent 实例不再共享状态. `agent.new_session()` 一行清空. |
-| **流式输出** | REPL 中边生成边显示, 不再等 5-30 秒看不到状态. tool_call 完整 reassembly + Ctrl-C 中断 + partial 内容入历史. 详见 §流式与中断. |
-| **双后端** | `MINICODE_BACKEND=ollama\|minimax` 切换. Ollama 本地零成本, MiniMax-M2.7 云端任务连续性显著好 (7B 在多步任务上有能力上限). 详见 §后端与启用. |
-| **Token / 成本可见** | 每个 turn 末尾显示 `tokens: X in + Y out = Z`; MiniMax 后端额外显示 `≈ ¥XX.XXXX` 估算成本. session 收尾给总计. |
-| **代码块伪 tool_call 兜底** | 模型把 ```bash/```diff/```json 等代码块当 tool 调用时 (7B 常发病), 系统层注入提醒 + 累计 2 次硬退出, 不再死循环. |
-| **PATH_ESCAPE 错误更可操作** | 错误消息直接给出"用相对路径"+ 例子 + LS 兜底建议, 模型不容易在错误后放弃. |
-| **SYSTEM 包含 workspace 路径** | 启动时把 cwd 注入 SYSTEM, 模型不再瞎猜路径. |
-
-## 后端与启用
-
-默认走本地 Ollama (零成本、断网可用、跑 7B). 想用云端大模型 (M2.7, 任务连续性好得多) 就切 minimax:
-
-```bash
-# 1) 复制 .env 模板:
-cp .env.example .env
-
-# 2) 编辑 .env, 填你的 MiniMax key (api: https://platform.minimaxi.com):
-#    MINICODE_BACKEND=minimax
-#    MINIMAX_API_KEY=sk-api-xxxxx
-
-# 3) (可选) 跑探针验证端点能用:
-python scripts/probe_minimax.py
-```
-
-`.env` 在 `.gitignore` 里, 永远不会被 commit. 仓库根的 `.git/hooks/pre-commit` 会扫常见密钥前缀 (`sk-api-` / `sk-ant-` / `ghp_` / `AIza` 等) 阻止 commit, 万一手滑也能挡住.
-
-切回 Ollama: `MINICODE_BACKEND=ollama` (或干脆删 `.env` 那行).
-
-## 流式与中断
-
-REPL 默认流式. 模型生成时文本边出边显示, 按行边界 + 80 字符上限刷新 (避免 Windows 终端逐 token 闪屏). tool_call 等完整 arguments 拼齐再用 `_box` 渲染, 不做半截 JSON 预览.
-
-Ctrl-C 中途打断: 已收到的 partial content 进 history (带 `[interrupted by user]` 标记), 半截 tool_call 不执行 (避免拿不完整 arguments 调工具).
-
-设 `MINICODE_STREAM=0` 强制非流式 (pytest / 脚本场景).
-
----
-
+# 05-session-and-streaming — 让本地 agent 用起来不别扭
 
 [![tests](https://github.com/xu-kai-quan/MiniCode-Agent/actions/workflows/test.yml/badge.svg)](https://github.com/xu-kai-quan/MiniCode-Agent/actions/workflows/test.yml)
 
-> 状态: **alpha**. 单人项目, 接口可能变. 工具层有 66 个 pytest 测试, 主链路稳定.
+> 状态: **alpha**, 但比 04 实用. 单人项目, 接口可能继续变. 工具层有 66 个 pytest 测试, 主链路稳定.
 
-用本地 Ollama (默认 `qwen2.5-coder:7b-instruct-q4_K_M`) 驱动的**交互式编码助手**: 你打开它, 它给你一个 `>` 提示符, 你可以连续提问, 它记得前面聊过什么, 会调用工具帮你干活。
+这是 MiniCode Agent 第 5 版. 一个文件 [todo.py](todo.py), 大约 2000 行 Python. 跑起来给你一个 `>` 提示符, 你跟它说"帮我建个项目"或者"看一下 todo.py 第 800 行解释一下", 它就动手干。
 
-整个程序就一个文件 [todo.py](todo.py), 约 1500 行 Python。
+## 它跟 04 的区别 — 一句话版本
 
-## v4 相对 v3 的主要变化
+**04 能跑, 05 能用**.
 
-| 主题 | v3 | v4 |
-|---|---|---|
-| 后端 | 本地 torch + transformers 加载 Qwen3.5-2B safetensors | Ollama HTTP (OpenAI 兼容 `/v1/chat/completions`), 默认 `qwen2.5-coder:7b-instruct-q4_K_M` |
-| 工具调用协议 | Qwen 自家的 `<tool_call>` XML, 自己正则解析 | OpenAI 结构化 `tool_calls`, 扔掉 XML 解析 |
-| 多文件/多点修改 | 只能多次 `edit_file` | 新增 `apply_patch` — unified diff, 跨文件两阶段锁 + 原子回滚 |
-| 依赖 | torch / transformers / safetensors | 仅 stdlib (前置装 Ollama 桌面版) |
+04 工程上已经合格 (原子工具、apply_patch 跨文件原子改动、66 个测试). 但实际用起来有几个让人想关掉它的地方:
 
-`apply_patch` 的设计要点: 先把所有目标文件的读后写锁一次性预检通过, 再在内存里算好每个文件的新内容, 最后一次性落盘; 中途任一步失败, 已写的文件立刻回滚到修改前状态。等价于小号的 `git apply --atomic`。
+- 等了 30 秒屏幕没动, 不知道是死了还是在思考
+- 7B 模型在多步任务里经常脱轨, 死循环 19 轮才超时退出
+- 本地 7B 跑长任务的连续性确实不如云端大模型, 但 04 没法切换
+- 跑一次任务不知道用了多少 token, 云端按 token 收费时心里没底
+- 多 agent 实例共享模块级全局变量, 状态串台
 
-## v3 相对 v2 的主要变化
-
-| 主题 | v2 | v3 |
-|---|---|---|
-| 工具分层 | 6 个工具平铺 | 三层: 高频原子 / 中频受控 / 低频兜底 |
-| 返回结构 | 裸字符串 | `ToolResult(status, data, text)` 统一协议 |
-| 文件搜索 | 没有 | `LS` / `Glob` / `Grep` (rg→Python 兜底) |
-| Grep 过滤 | — | `file_pattern` 限定文件类型 |
-| 写文件保护 | 无 | 读后写 + 乐观锁 (NOT_READ / CONFLICT) |
-| 模型路径 | 硬编码 | 支持 `MINICODE_MODEL_DIR` 环境变量 |
-| 测试 | 无 | `pytest tests/` (42 个测试, ~0.6s) |
-| Windows 终端编码 | GBK 撞 box 字符崩溃 | 强制 stdout UTF-8 |
+05 一个一个修. 这份 README 重点讲**每件事是为什么做、怎么做、起没起效果**. 不是技术参考, 是过程记录.
 
 ---
 
-## 一、跑起来长什么样
+## 目录
 
-启动:
-
-```sh
-python todo.py
-```
-
-你会看到一个横幅, 显示 Ollama 后端地址、当前模型、工作目录、bash 路径、grep 模式 (rg 或 Python 兜底)、已注册的工具列表, 然后是 `>` 提示符:
-
-```
-> 帮我建一个 mypkg, 里面放 __init__.py 和一个 add(a,b) 函数
-```
-
-它会:
-
-1. 先思考 ("我应该先建目录, 再写两个文件")
-2. 调用 `todo` 工具列出步骤
-3. 调用 `bash` 建目录
-4. 调用 `write_file` 写文件
-5. 把 todo 项标记为完成
-
-干完之后回到 `>`, 你可以继续问别的, 它**记得**刚才发生了什么。
-
-输入 `/exit` 退出, `/clear` 清空对话从头开始, `/help` 看所有命令。
+- [1. Session — 把散落的状态收回来](#1-session--把散落的状态收回来)
+- [2. 流式输出 — 看见模型在思考](#2-流式输出--看见模型在思考)
+- [3. 双后端 — Ollama 和 MiniMax 之间切](#3-双后端--ollama-和-minimax-之间切)
+- [4. Token 和成本可见 — 不再黑盒烧钱](#4-token-和成本可见--不再黑盒烧钱)
+- [5. 代码块伪 tool_call — 系统层把 prompt 兜不住的接住](#5-代码块伪-tool_call--系统层把-prompt-兜不住的接住)
+- [6. PATH_ESCAPE 错误信息 — 不让模型在错误后放弃](#6-path_escape-错误信息--不让模型在错误后放弃)
+- [7. 流式 Read 和 SYSTEM 精简 — 两个事后优化](#7-流式-read-和-system-精简--两个事后优化)
+- [8. 安全脚手架 — .env 和 pre-commit hook](#8-安全脚手架--env-和-pre-commit-hook)
+- [9. 怎么跑起来](#9-怎么跑起来)
+- [10. 已知问题 / 还能优化的地方](#10-已知问题--还能优化的地方)
+- [11. 给后来者: 如果你想读源码](#11-给后来者-如果你想读源码)
 
 ---
 
-## 二、核心概念
+## 1. Session — 把散落的状态收回来
 
-### 1) 什么叫 "agent"?
+### 04 是什么样
 
-普通调用大模型: 你问一句, 它答一句, 结束。
-
-Agent 是这样: 你问一句, 模型答一句**带着工具调用**, 系统真的去执行那个工具, 把结果再喂回模型, 模型看到结果再决定下一步…… 直到模型说"我做完了"。
-
-简单说就是一个 `while` 循环:
+04 的可变状态散在三个地方:
 
 ```python
-while True:
-    回复 = 模型(对话历史)
-    工具调用列表 = 解析(回复)
-    if 没有工具调用:
-        break          # 模型不再想干活, 退出
-    for 调用 in 工具调用列表:
-        结果 = 执行(调用)
-        对话历史.append(结果)
+# 模块顶层全局
+TODO = TodoManager()
+
+# agent 实例上
+class ReActAgent:
+    def __init__(self, ...):
+        self.history: list[Message] = [...]
+        self.rounds_since_todo = 0
+
+# registry 实例上
+class ToolRegistry:
+    def __init__(self, ...):
+        self.read_cache = ReadCache()
 ```
 
-**这个循环就是 agent 的全部本质**。本项目里, 它在 [todo.py](todo.py) 的 `run_turn` 函数里。
-
-外面再套一层 REPL ( read-eval-print loop, 就是那个 `>` 提示符), 让你能连续提问。这两层是分开的:
-- **内层** (`run_turn`): 把"一条用户输入"跑到"模型不再调工具"。
-- **外层** (`repl`): 持续读取你的输入, 维护对话历史, 拦截斜杠命令。
-
-### 2) 工具是什么?
-
-工具就是"模型可以请求系统帮它做的事"。按"频率 × 确定性"分三层:
-
-**高频原子层** (主力, 强约束):
-
-| 工具名 | 干什么 | data 字段 |
-|---|---|---|
-| `LS` | 列目录 (不递归) | `entries` |
-| `Glob` | 按文件名模式找文件 (递归) | `paths` |
-| `Grep` | 按正则搜文件内容, 可加 `file_pattern` 限制文件类型 | `matches` |
-| `Read` | 带行号读取文件, 支持 `limit`/`offset` | `content`, `lines`, `total_lines` |
-
-**中频受控层** (有副作用, 加保险 — 见 §2.2):
-
-| 工具名 | 干什么 | data 字段 |
-|---|---|---|
-| `write_file` | 创建或覆盖文件 | `bytes_written` |
-| `append_file` | 追加内容到文件末尾 (分片写大文件) | `total_bytes` |
-| `edit_file` | 把文件里某段唯一文本精确替换 | — |
-| `apply_patch` | 应用 unified diff, 可跨多文件, 两阶段锁 + 任一失败全部回滚 | `files` (每文件的 op/hunks) |
-| `todo` | 写/更新待办列表 (规划步骤) | `items` |
-
-**低频兜底层** — `bash`: 留给原子工具不覆盖的边角需求 (git, 跑脚本, 包管理)。**明确不是主链路**, prompt 和 description 都这么说。
-
-模型并不能直接动你的电脑 — 它只能"输出一段表示工具调用的文本", 由系统来真正执行。这是一道很重要的安全边界。
-
-### 2.1) 工具返回的统一结构 ToolResult
-
-每个工具都返回同一种结构:
+要"清空当前会话从头开始", 得三处都 reset:
 
 ```python
-ToolResult(
-  status: "success" | "partial" | "error",
-  text:   str,    # 自然语言摘要 — 真正喂给模型的就是这段
-  data:   dict,   # 结构化结果 — 只进日志面板, 不喂模型
-)
+def reset(self):
+    self.history = [Message.system(...)]
+    self.rounds_since_todo = 0
+    TODO.items.clear()              # 全局变量, 别忘了
+    self.registry.read_cache.clear() # 另一个对象上的, 也别忘了
 ```
 
-**为什么 data 不喂模型?** 给小模型一坨 JSON, 它会精神分裂 — 一会儿当对话, 一会儿当数据要 parse。两条管道分开: text 是给模型看的自然语言, data 是给程序读的结构化事实。日志面板会把它们分开显示, UI 也只用 data。
+### 这有什么问题
 
-**status 三态怎么分?**
+不是"代码风格不好"那种问题, 是**真问题**:
 
-- `success`: 任务完成, 没有信息被默默丢弃。
-  - `Glob` 没匹配到 → success (返回空数组就是事实)
-  - `Read` 用户传了 `limit=100` 拿到 100 行 → success (这是契约)
-- `partial`: 任务完成但内容被截断, 用户预期 vs 实际之间有信息丢失。
-  - `Read` 没传 limit, 被字符上限砍掉 → partial
-  - `Grep` 命中过多, 只返回前 N 条 → partial
-  - `bash` 输出超过 8000 字符 → partial
-- `error`: 工具本身没跑成。`data["code"]` 给机器读的错误码 (`NOT_FOUND` / `PATH_ESCAPE` / `BAD_REGEX` / `NOT_READ` / `CONFLICT` / ...), `text` 给模型读的描述。
+1. **模块级 `TODO` 是全进程共享的** — 同一个 Python 进程跑两个 agent 实例, 它们的 todo 列表会互相污染. 单进程 REPL 看不出来, 但写测试的时候就麻烦
+2. **状态散三处, reset 必漏** — 加新的状态字段时, 你得记得改 reset(). 反例: 加个 codeblock_nag_count 在 agent 上, reset 时容易忘记清, 串到下次任务
+3. **没法表达"不同会话"** — 想做"这次跑用这个 system prompt, 下次跑换一个", 没有清晰的边界
 
-注意: bash 命令 **跑了但 exit code 非 0** 算 `success`, 不是 `error` — 因为工具本身正常工作, 模型自己能从 `exit=N` 看出命令失败了。`error` 严格留给"工具自己崩了"。
+### 怎么改
 
-### 2.2) 中频受控层: 读后写 + 乐观锁
+把所有可变状态封进一个 dataclass:
 
-写类工具 (`write_file` / `append_file` / `edit_file`) 有两道保险, **dispatch 层强制**, 模型 handler 看不见这层逻辑:
+```python
+@dataclass
+class Session:
+    history: list[Message]
+    todo: TodoManager = field(default_factory=TodoManager)
+    read_cache: ReadCache = field(default_factory=ReadCache)
+    rounds_since_todo: int = 0
+    codeblock_nag_count: int = 0
+    prompt_tokens_total: int = 0
+    completion_tokens_total: int = 0
+    # ... 等等
 
-**1. 读后写 (read-before-write)** — 改一个**已存在**的文件之前, 必须先 `Read` 它。否则 dispatch 直接返回:
-
-```
-error [NOT_READ]: File 'core/llm.py' must be read before edit_file.
-Call Read first to load it into context.
-```
-
-新建文件不需要 (强制 Read 一个不存在的文件没意义)。这条规则防止模型"凭记忆"乱改 — 它必须先把当前内容拉进上下文, 看到了, 才能改。
-
-**2. 乐观锁** — `Read` 时记录文件的 `(mtime_ns, size)`, 写之前验证没变。变了就拒:
-
-```
-error [CONFLICT]: File 'core/llm.py' changed since last read
-(was 4217 bytes, now 4380). Re-read it before retrying.
+    @classmethod
+    def new(cls, system_prompt: str) -> "Session":
+        return cls(history=[Message.system(system_prompt)])
 ```
 
-这个 race 真实存在: IDE 自动保存、其他终端进程、git 切分支, 都可能在 Read 和 Write 之间动文件。乐观锁让模型察觉而不是默默覆盖别人的工作。
+`ReActAgent` 不再持有 history/计数器, 通过 property 代理到 session:
 
-**写成功后** cache 自动刷新成新 stat — 模型可以连续 `edit_file` 同一个文件而不必重新 Read, 但若期间外部有改动, 下一次仍会 CONFLICT。
+```python
+class ReActAgent:
+    @property
+    def session(self) -> Session:
+        return self.registry.session
 
-实现细节: `ReadCache` 是 `ToolRegistry` 的成员, 工具 handler 仍是纯函数。`Read` 把 stat 通过约定的 `data["_stat"]` 回传, dispatch 写入 cache 后剥掉, 模型既看不到这字段也不需要管它。
+    @property
+    def history(self) -> list[Message]:
+        return self.session.history
 
-### 3) 为什么要有 todo (规划) 工具?
+    def new_session(self) -> None:
+        # reset 一行解决: 重建 Session, 所有字段默认值清零
+        self.registry.session = Session.new(self.system_prompt)
+```
 
-模型在多步任务里很容易**走神**: 对话越长, 它越会忘记最初的目标, 或者重复做已经做过的事。
+### 起没起效果
 
-解决办法是让它**先把步骤写下来**, 写下来的东西会留在对话历史里, 之后每一轮都能看到, 相当于一份"外部记忆"。规则有两条:
+起了, 而且**红利不止于 reset 干净**:
 
-- 任何超过一步的任务, 必须先调 `todo` 列出步骤。
-- 同一时刻只能有一个步骤是 `in_progress`, 强制它**一件一件来**。
+- **写测试更顺** — 之前 audit 脚本里我会 build_default_registry 三次开三个独立 registry 来绕开 read_cache 污染. 现在新 session 一行就独立
+- **token 计数有了归宿** — 加 prompt_tokens_total/completion_tokens_total 这两个新字段时, 直接进 Session, 不需要再决定"挂在哪里". 见 [§4](#4-token-和成本可见--不再黑盒烧钱)
+- **后面所有新状态字段都进 Session** — codeblock_nag_count、estimated_turns/exact_turns 都是这次设计后顺手加的, 没纠结过"放哪"
 
-如果模型连续 3 轮没更新 todo, 系统会主动注入一条提醒 ("该更新规划了"), 这个机制叫 **nag**。
+更重要的是**它没引入新复杂度**. 改完 ReActAgent.__init__ 那 7 行代码, dispatch / step / run 全部不需要动 — 因为 history 这些通过 property 代理, 用法没变.
 
-### 4) 为什么要"沙箱"?
+### 中间的尝试
 
-模型理论上可以请求写到任何路径。万一它想 `write_file("C:/Windows/...")` 怎么办?
+我在动手前讨论过三个方案 (具体见 commit `a156839` 之前的对话):
 
-文件类工具都先做一次**路径检查**: 把传入的路径解析成绝对路径, 如果它不在启动时的当前目录之下, 直接拒绝。这样模型的破坏范围就被锁在工作目录里了。
+- **方案 A**: 所有 handler 签名加 `session` 参数 — 侵入太大, 9 个工具有 8 个根本不需要 session
+- **方案 B**: dispatch 检测 handler 签名里有没有 `_session: Session`, 有就注入 — 优雅, 选了这个
+- **方案 C**: registry 持有 session 引用 — 之前以为破坏"无状态 registry", 后来发现 04 的 registry 已经持有 read_cache 状态了, 升级为 session 不算新耦合, **最后用的是这个**
 
-(`bash` 工具是个例外 — 既然叫 bash, 就把权力交给 shell 了, 它能 `cd ..` 出去。想更安全的话别用 bash。)
+最终落地: registry 持有 session, dispatch 通过反射给声明了 `_session: Session` 的 handler 自动注入. 反射默认排除 `_` 前缀参数 (避免 `_session` 跑进给模型看的 schema). 工具表里只有 `tool_apply_patch` 和 `tool_todo` 用了这个机制 — 其他 8 个 handler 是纯函数, 跟 session 完全脱耦.
 
-### 5) 为什么 bash 优先用 Git Bash?
+---
 
-在 Windows 上, Python 默认调用的"shell"其实是 `cmd.exe`, 模型如果写 `ls -la`, 会得到"`ls` 不是内部命令"。这相当于**工具名在骗模型** — 工具叫 bash, 实际不是 bash。
+## 2. 流式输出 — 看见模型在思考
 
-所以启动时会去找 Git for Windows 自带的 `bash.exe`, 找到就用它。横幅里会明确显示当前用的是哪个 shell, 让你一眼看见。
+### 痛点
 
-注意: 我们**故意不用** WSL 的 bash, 因为它输出 UTF-16 编码、路径语义 (`E:\` 在 WSL 里是 `/mnt/e/`) 也对不上工作目录, 引入的麻烦比解决的多。
+04 默认非流式. 你输入 query, 看到 `→ [1] 调用模型 …` 然后屏幕静止 5-30 秒. 第一次用以为它挂了. 7B 在 4060 上的速度大约 40 token/秒, 一个稍长的回答就要等十几秒.
 
-### 5.1) Grep 为什么"有 rg 用 rg, 没有用 Python"?
+### 怎么做
 
-诚实问题, 诚实答案: rg (ripgrep) 在几万行代码库上比纯 Python 快两个数量级, 用户真实项目一定会踩到这个差距。但**硬依赖 rg 违反了"开箱即用"的承诺** — 跟 bash 工具"找 Git Bash, 找不到退 cmd"是同一个原则。所以启动时检测一次 `rg`, 有就用, 没有就退到 Python 兜底版。横幅里会显示当前走哪条路。
+OpenAI 兼容协议的流式很标准 — `payload["stream"] = True`, response 是 SSE (Server-Sent Events), 一行行 JSON delta. 但**陷阱比看起来多**.
 
-Python 兜底版会跳过 `.git` / `node_modules` / `__pycache__` / `.venv` / `venv` 这种大型无用目录, 否则在大仓库里慢得不可接受。
+我先调研了 Claude Code (CLI) 的流式行为 (因为它是同类产品, 它做对的我抄, 它做错的我避). 重点观察:
 
-### 6) 为什么需要"分片写文件"?
+- **不是 token-by-token 输出** — Claude Code 也是 chunk-based buffering. 原因: 终端逐 token print 闪屏严重, 中文 + ANSI 颜色组合下尤其卡 (有人提过 issue #29213)
+- **tool_call 等完整 arguments 才显示** — 不做"半截 JSON 预览". 不然显示个 `{"path":"`没了, 用户也看不懂
+- **Ctrl-C 应当干净中断** — 但 Claude Code 自己的 issue (#26802, #17466) 抱怨 Ctrl-C 不可靠. 我们要做对
 
-模型一次生成的 token 数量有上限。要写一个 500 行的 HTML, 一轮可能写不完, 半截被截断, 文件就没真正落盘。
+我们的实现 (在 [todo.py 的 `_StreamRenderer`](todo.py)):
 
-解决办法两层:
+1. **OllamaClient.chat_stream** 是个 generator, yield 出每个 delta
+2. **`_StreamRenderer.feed(delta)`** 累积 content / tool_calls. 文本累积到行边界 (`\n`) 或 80 字符上限再 flush
+3. **tool_call reassembly** — OpenAI 协议把 `tool_calls[i].function.arguments` 拆成多个分片, 按 `index` 累加. 但 Ollama 实际把整个 tool_call 一次性塞进单 delta, 跟 spec 不一致 (但对我们更友好, reassembly 一片或 N 片都能吃)
+4. **think 标签不在流式期分色** — Qwen 的 `<think>...</think>` 跨 chunk 边界处理太脆 (考虑 chunk 切在 `<thi` + `nk>` 中间), 流式期间整段普通色, 等 finalize 用 `split_think` 一次性剥离进 history
+5. **Ctrl-C 处理** — 流式 loop 里 try/except KeyboardInterrupt, 已收到的 partial 入 history (带 `[interrupted by user]` 标记让模型下次知道), 半截 tool_call **不执行** (避免拿不完整 arguments 调工具)
 
-- **多给一个工具**: `append_file`, 模型可以"先 write_file 写第一块, 再多次 append_file 加后面的块"。
-- **系统兜底检测**: 如果模型输出里有 `<tool_call>` 开头但没闭合, 说明被截断了。系统不会假装"完成", 而是主动告诉模型"你被截了, 改用分片重来"。
+### 起没起效果
 
-这体现一个更大的设计原则: **prompt 是软约束, 系统是硬约束**。能在 prompt 里提示就提示, 但关键的不变量必须在系统层兜底, 因为小模型不一定听 prompt。
+起了, 体验差异巨大. 但**也暴露了一个真相**: 第一轮模型生成 tool_call 时, 大部分内容是 tool_call 而不是 content, 所以"流式视觉体验"那一轮其实不明显. 真正闪光的是**第二轮 — 模型拿到工具结果后生成给用户的可见答案**, 那时候才是大段 token 流出.
 
-### 7) 模型是怎么"请求调用工具"的?
+跑过真 Ollama 探针 (`scripts/probe_stream_v3.py`) 验证: 长回复 (~6000 字符) 拆成 1168 个 deltas, 平均每 5 字符一个 delta, 每 23ms 一次 — 真 token 级流式.
 
-v4 走 **OpenAI 兼容的结构化 `tool_calls`** (Ollama 的 `/v1/chat/completions` 原生支持)。模型返回的 assistant message 形如:
+### 中间的尝试
 
-```json
-{
-  "role": "assistant",
-  "content": null,
-  "tool_calls": [
-    {"id": "call_1", "type": "function",
-     "function": {"name": "Read", "arguments": "{\"path\":\"a.py\"}"}}
-  ]
+写了三个版本探针 (probe_stream.py / v2 / v3, 后两个保留为 `scripts/probe_stream_v3.py`). v1 测短回复 + tool_call, v2 测中等长度, v3 强制长英文回复. 结论:
+
+- **短回复时 Ollama 会 batch dump** (1 个 delta 包全部) — 看起来像没流式, 实际是 Ollama 内部缓冲优化, 不是 bug
+- **长回复时 Ollama 真流式** — token 级 delta
+- **MiniMax 流式粒度更粗** — 平均 130 字符/delta (按句/段而不是 token), 视觉上"成段成段"出, 仍然流式
+
+### Ctrl-C 这件事我们做对了
+
+Claude Code 的 issue 26802 / 17466 抱怨 escape 不可靠. 我们的实现:
+
+```python
+try:
+    for delta in self.llm.chat_stream(messages, tools):
+        renderer.feed(delta)
+except KeyboardInterrupt:
+    interrupted = True
+msg = renderer.finalize()  # 先 flush partial 内容
+if interrupted:
+    print(f"(interrupted by user — partial output kept)")
+```
+
+- partial content 立刻进 history, 不丢
+- 半截 tool_call (假设 arguments 流到一半) **不执行** — 这是关键安全策略. 我们宁可错失一次 tool 调用, 也不拿不确定的 arguments 去调工具
+
+测试用 fake LLM 模拟"流到一半 raise KeyboardInterrupt", 验证: visible 内容入历史 + `[interrupted by user]` 标记 + actions 为空. 通过.
+
+---
+
+## 3. 双后端 — Ollama 和 MiniMax 之间切
+
+### 为什么要做
+
+04 一直绑死 Ollama 跑本地 7B. 跑下来发现 7B 在多步任务上**有能力上限**:
+
+实际跑过 query "解释一下 todo.py 第 800-900 行 apply_patch 的两阶段锁怎么工作的", 7B 的表现:
+
+- Turn 1: 调 `LS('/path/to/todo.py')` — 把训练数据里的占位符当真实路径
+- Turn 2: 收到 PATH_ESCAPE, 不重试, 直接说"please provide a path"
+- 改了 SYSTEM 加 workspace 后, 第二次跑:
+- Turn 1: 调对了 Read
+- Turn 2: 莫名其妙调 apply_patch 传空 patch
+- Turn 3: 拿到 PARSE_FAILED, 在 todo 里写"Review the provided unified diff" — 幻觉了一个 diff
+- Turn 4: 给用户回答"please ensure your unified diff includes proper headers" — 把自己当客服了
+
+7B 的"任务连续性"问题在 README §3.4 (04 时代) 早就记录过, 这是模型能力上限, prompt 治不好.
+
+### 想清楚再动手
+
+我先讨论了三个方向:
+
+1. **接受现状** — 把"7B 跑长解释问题不可靠"写进已知局限, 不再为这个改代码
+2. **换更大模型** — 验证是不是模型能力问题
+3. **加更狠的系统层约束** — 比如 query intent 分类禁用某些工具. 这条违背"不过度设计"原则, 否决
+
+选了 1+2: 接受 7B 的极限 + 提供云端切换.
+
+### 用 MiniMax 还是别的
+
+研究了一下 (调研报告归档在 commit `079b7d3` 的对话里). MiniMax-M2.7:
+
+- 200K context, 131K output (M2 系列)
+- 公开标称为"自主编码 agent"打造, SWE-Bench 分数高
+- 国内可访问 (`api.minimaxi.com`)
+- **OpenAI 兼容端点** — 这一条是关键, 我们的 OllamaClient 是 OpenAI 形态, 复用代码量极大
+
+也研究了它的 Anthropic 兼容端点 (`/anthropic/v1/messages`), 但 litellm #18834 等 issue 有已知 bug, 选 OpenAI 路径稳得多.
+
+### 怎么实现
+
+抽出一个共享基类:
+
+```python
+class _OpenAICompatClient:
+    """OpenAI-兼容 HTTP 客户端基类 — Ollama 和 MiniMax 共享这套."""
+
+    def __init__(self, base_url, model, timeout, extra_headers=None):
+        self.base_url = base_url
+        self.model = model
+        self.extra_headers = extra_headers or {}
+
+    def chat(self, messages, tools): ...
+    def chat_stream(self, messages, tools): ...
+
+
+class OllamaClient(_OpenAICompatClient):
+    provider_name = "Ollama"
+    # 默认 base_url 本地, 不需要 auth header
+
+class MinimaxClient(_OpenAICompatClient):
+    provider_name = "MiniMax"
+    def __init__(self, api_key, ...):
+        super().__init__(extra_headers={"Authorization": f"Bearer {api_key}"})
+```
+
+`load_model()` 工厂按 `MINICODE_BACKEND` 环境变量选:
+
+```python
+def load_model() -> LLMClient:
+    if BACKEND == "minimax":
+        return MinimaxClient(api_key=MINIMAX_API_KEY)
+    elif BACKEND == "ollama":
+        return OllamaClient()
+    else:
+        raise RuntimeError(f"Unknown MINICODE_BACKEND={BACKEND!r}")
+```
+
+切换方法: 在项目根 `.env` 里写 `MINICODE_BACKEND=minimax`, 启动时自动读. 见 [§9](#9-怎么跑起来).
+
+### 中间踩的坑
+
+跑探针验证 MiniMax 端点时碰到 **HTTP 404**. 直接 curl 同样 payload 是 200. 排查后发现:
+
+```python
+final stream URL: https://api.minimaxi.com/v1/v1/chat/completions
+                                          ^^^^^^^^
+                                          /v1 重复了
+```
+
+`base_url = "https://api.minimaxi.com/v1"` (来自 .env.example 默认值), 然后 chat_stream 里又拼 `/v1/chat/completions`. 修法: 跟 Ollama 一样, base_url 只到主机名 `https://api.minimaxi.com`, client 内部统一拼 `/v1/chat/completions`. 在 .env.example 里加了显式注释 "do NOT include /v1 in base_url" 防止下次再犯. (commit `d91f227`)
+
+### 起没起效果
+
+跑同一个 query (解释 apply_patch 锁) 对比:
+
+| | 7B (Ollama) | M2.7 (MiniMax) |
+|---|---|---|
+| Turn 1 | LS 错误路径 | Read 正确 offset/limit |
+| Turn 2 | 调 apply_patch 传空 patch | Grep 找 def tool_apply_patch 真实位置 |
+| Turn 3 | todo 摆烂 + 让用户给 patch | Read 1050-1250 行 |
+| Turn 4 | 教用户怎么写 diff 格式 | 流式生成完整结构化解释 |
+| 结果 | 没回答原问题 | 完整回答, 含三阶段拆解 + 表格 + 总结 |
+
+M2.7 还**自我纠错** — Turn 2 它说"读到的 lines 800-900 是 grep 工具, apply_patch 不在这个范围", 主动 Grep 找真实位置. 这种"我读错了, 再来"的元认知能力, 7B 完全做不到.
+
+---
+
+## 4. Token 和成本可见 — 不再黑盒烧钱
+
+### 为什么要做
+
+切到 MiniMax 后第一次跑, 跑完一脸懵 — 烧了多少钱? 不知道. 跑第二次还是不知道. 长任务跑下来更没数. 云端按 token 计费, 不能黑盒.
+
+### 怎么做
+
+**取数据**: OpenAI 协议规定流式的 usage 在最后一个 chunk 顶层 (不在 delta 里), 但需要在请求里加 `stream_options: {include_usage: true}`. Ollama 不识别这个字段直接忽略 (无害), MiniMax 会照办.
+
+```python
+payload = {
+    "model": self.model,
+    "messages": messages,
+    "stream": True,
+    "stream_options": {"include_usage": True},  # 关键
 }
 ```
 
-系统从 `tool_calls` 字段直接读出工具名和 JSON 参数, 不再像 v3 那样用正则从文本里抠 `<tool_call>` XML。好处: 少一层脆弱的自解析, 而且能原生支持"并行调用多个工具"。
+`chat_stream` 解析 chunk 时除了取 delta, 也看顶层有没有 `usage`:
 
-某些模型 (包括 qwen2.5-coder) 会在正式回答前写 `<think>...</think>` 段, 那是内部推理。我们打印它给你看, 但**不存回对话历史** — 否则历史会越塞越重。
+```python
+if isinstance(chunk.get("usage"), dict):
+    self.last_usage = chunk["usage"]  # 留给调用方取
+```
+
+**优雅降级**: 如果后端没给 usage (Ollama 流式不给), 用字符数估算 (中英混合大致 1 token ≈ 3 字符), 标 `(estimated)` 让用户知道是估的.
+
+**累加到 Session**: 上面 §1 已经有 Session 了, 加 `prompt_tokens_total` / `completion_tokens_total` 字段, 每个 turn 累加, run() 退出时显示总计.
+
+**显示成本**: MiniMax-M2.7 当前定价大约 input ¥1/M, output ¥8/M. 我们用保守值 (¥2/M, ¥8/M). 价格放在模块顶常量, 改一处即可:
+
+```python
+MINIMAX_PRICE_INPUT_PER_M = float(os.environ.get("MINIMAX_PRICE_IN", "2.0"))
+MINIMAX_PRICE_OUTPUT_PER_M = float(os.environ.get("MINIMAX_PRICE_OUT", "8.0"))
+```
+
+### 长什么样
+
+每个 turn 末尾一行:
+
+```
+→ [2] tokens: 2.1K in + 819 out = 2.9K  ≈ ¥0.0107
+```
+
+DONE / GAVE UP / MAX ROUNDS 时给总计:
+
+```
+┌─ ✅ DONE ════════════════════════════════════════════════
+│ session total: 5.3K in + 2.1K out = 7.4K  ≈ ¥0.0274
+└═══════════════════════════════════════════════════════════
+```
+
+如果是 Ollama (本地零成本), 不显示 `≈ ¥` 部分; 如果是估算, 标 `(estimated)`.
+
+### 中间的尝试
+
+最初想"非流式调一次额外的请求取 usage"——浪费一次 API call. 否决.
+
+也想过"加 tiktoken 算精确 token"——破坏"零依赖"卖点, 而且 tiktoken 也算不准 MiniMax 的 token. 否决.
+
+最后选了"include_usage 优先, 估算兜底"的方案 — 不引依赖, 后端给真值就用真值, 没有就估算并标注. 实测 MiniMax 给的是真值, Ollama 流式给不出但没关系 (本地零成本无所谓).
 
 ---
 
-## 三、怎么跑
+## 5. 代码块伪 tool_call — 系统层把 prompt 兜不住的接住
 
-### 准备工作
+### 04 已经踩过的坑
 
-1. **装 Ollama**: 从 https://ollama.com/download 装桌面版, 启动它 (默认监听 `http://localhost:11434`)。
-2. **拉模型**:
-   ```sh
-   ollama pull qwen2.5-coder:7b-instruct-q4_K_M
-   ```
-   想换模型或换 Ollama 地址, 用环境变量:
-   ```sh
-   export MINICODE_MODEL="qwen2.5-coder:14b"             # macOS/Linux
-   set MINICODE_OLLAMA_URL=http://192.168.1.10:11434     # Windows cmd
-   $env:MINICODE_TIMEOUT="600"                           # PowerShell (首载慢可调大)
-   ```
-3. **Python 依赖**: v4 运行时**只用标准库**, 不需要 `pip install` 任何东西。
-   ```sh
-   # 跑测试才需要 pytest
-   pip install -r requirements-dev.txt
-   ```
-4. **可选, 推荐**: 装 Git for Windows (bash 工具会用), 装 ripgrep (Grep 会快两个数量级)。
-5. **GPU**: Ollama 自己管 CUDA/Metal, 你不用操心; 显存够就自动上 GPU, 不够就落 CPU。
+04 README §3.2 记录过: 7B 经常不走 `tool_calls` 字段, 而是在 content 里写 ```json 块假装调工具. 系统收不到工具调用, 任务卡死. 04 在 SYSTEM 里加了 CRITICAL 段堵 ```json 和 ```diff/```patch.
 
-### 启动 (推荐: 交互模式)
+但 05 实际跑发现: **堵了 ```json/```diff, 模型改用 ```bash 或 ```shell**. 你压一处, 它从另一处冒出来.
 
-进到**你希望它工作的目录** (所有文件操作都被锁在启动时的 pwd 里), 然后:
+### 两层防线
 
-```sh
-python path/to/05-session-and-streaming/todo.py
+**Prompt 层** (软约束) — SYSTEM 里把 ```bash/```sh/```shell 也加进禁令, 并且讲清楚 RUN vs SHOW 的区别 (怕误伤"展示代码"的合法用法):
+
+```
+TOOL-CALL PROTOCOL (critical): when invoking a tool, emit a real
+structured tool_call. NEVER write the call as visible text — not as
+```json, ```diff, ```patch, ```bash, ```sh, or any other code block
+containing what should have been a tool argument. ...
 ```
 
-横幅出现后, 在 `>` 后面输入你想让它做的事。
+**系统层** (硬约束) — 不指望 prompt 全靠. 在 `run()` 主循环加检测:
 
-### 启动 (一次性模式)
+```python
+_DODGED_TOOL_BLOCK_RE = re.compile(
+    r"```(?:bash|sh|shell|diff|patch|json)\b",
+    re.IGNORECASE,
+)
 
-如果你只想跑一个任务就退出, 直接传命令行参数:
-
-```sh
-python path/to/05-session-and-streaming/todo.py "把 hello.py 改成带类型提示的版本"
+def looks_like_dodged_tool_call(text: str) -> bool:
+    """模型在 visible 里写了 ```bash/```diff 等代码块 — 大概率是想绕过 tool_calls."""
+    return bool(_DODGED_TOOL_BLOCK_RE.search(text))
 ```
 
-### 跑测试
+如果一轮没 tool_call 但 visible 里命中这个正则, **不立刻 DONE**, 而是注入一条 reminder user message 重来:
 
-```sh
-pip install -r requirements-dev.txt
+```python
+if not res.actions:
+    if looks_like_dodged_tool_call(res.visible):
+        sess.codeblock_nag_count += 1
+        if sess.codeblock_nag_count > self.CODEBLOCK_NAG_LIMIT:  # 默认 2
+            _box(f"⛔ GAVE UP", ...); return
+        _box(f"⚠️  CODEBLOCK NAG ({sess.codeblock_nag_count}/2)", ...)
+        self.history.append(Message.user(_CODEBLOCK_REMINDER))
+        continue
+```
+
+### 为什么禁这 6 个语言不禁别的
+
+`bash / sh / shell / diff / patch / json` 这 6 个在 agent 场景下**几乎只在"绕过 tool_calls"时出现**. 用户不会问"教我写 diff" 或 "解释下这个 json schema". 误伤率极低.
+
+`python / js / go / c++ / sql` 这些在"展示代码示例"场景里高频合法 (回答"教我写一段 Python"必然会用 ```python). 不在触发列表里, 防止误伤.
+
+### 第一次实现踩的坑
+
+最初我写的版本: **任何 tool_call 都重置 codeblock_nag_count**. 结果跑出灾难性振荡:
+
+- Turn 1: dodge ```bash → NAG 1/2
+- Turn 2: 模型调 todo (摆烂凑数, 不解决任何问题) → counter 重置为 0
+- Turn 3: dodge ```bash → NAG 1/2 (又是 1/2!)
+- Turn 4: 摆烂 todo → 重置
+- ... 死循环到第 19 轮 MAX ROUNDS 才退出
+
+原因: 一次合法 tool_call 不应"洗白"前面的嘴硬, 否则模型用 todo 摆烂就能永远绕过. 修了之后 (commit `580e9bb`):
+
+- counter 在一次 `run()` 内**只增不减**
+- 只在每个 `run()` **入口归零** (上个任务的累计不该惩罚下个任务)
+
+实测后振荡场景在第 5 轮触发 GAVE UP, 不再 19 轮死循环.
+
+---
+
+## 6. PATH_ESCAPE 错误信息 — 不让模型在错误后放弃
+
+### 现象
+
+7B 模型有个倾向: 工具返回错误后, 把它当**任务终止信号**. 比如:
+
+- 调 LS('/path/to/todo.py') → PATH_ESCAPE
+- 不重试, 直接对用户说"please provide a path"
+
+**模型把 PATH_ESCAPE 解读成了"用户给的路径错"而不是"我自己用错了"**.
+
+### 修法
+
+错误消息本身是引导. 改 `_safe_path` 抛的 ValueError 文案:
+
+```python
+raise ValueError(
+    f"Path '{p}' is outside the workspace ({workdir}). "
+    f"Use a path RELATIVE to the workspace — e.g. 'todo.py', "
+    f"'src/foo.py', or '.' for the workspace root. "
+    f"If you don't know what's there, call LS with no arguments first."
+)
+```
+
+四个动作:
+1. 说出 workspace 在哪
+2. 说"用相对路径"
+3. 给三个具体例子
+4. 给恢复路径 (call LS 看看)
+
+加上 SYSTEM 顶部已经有 WORKSPACE 段说明工作目录, 模型有两次接触到正确做法的机会 (启动时一次 + 出错时一次).
+
+### 中间的尝试
+
+讨论过加第三层"SYSTEM 加错误后必须重试的强制约束". 否决, 理由: SYSTEM 已经够长了, 加新的禁令时会摊薄前面已有的. **错误消息引导是最直接的兜底, 不引入新 prompt 噪音**.
+
+### 起没起效果
+
+7B 的失败模式不再是"放弃", 改成"乱试别的工具" (后来又催生了 §5 的 dodge 检测). 错误消息对 M2.7 几乎无影响 (它本来就会重试).
+
+---
+
+## 7. 流式 Read 和 SYSTEM 精简 — 两个事后优化
+
+这俩不是"新功能", 是 v5 大改完成后扫一遍代码做的清洁工作. 但都修了真问题, 不是为改而改.
+
+### 优化 G: 流式 Read
+
+**问题**: `tool_read` 把整个文件读进内存:
+
+```python
+all_lines = p.read_text(...).splitlines()  # 全文加载
+selected = all_lines[start:end]              # 然后切片
+```
+
+对 50MB 日志文件 + `Read(limit=100, offset=0)`, 仍然全文加载. Ollama 时代不显眼 (本地内存便宜), 接 MiniMax 后**输入 token 变贵** — 真不能浪费.
+
+**修法**: 流式读到 `start + limit` 行就**停止 append**, 但**继续读到 EOF 计数行数** (拿到精确 total_lines):
+
+```python
+with p.open("r", encoding="utf-8", errors="replace") as f:
+    for i, raw in enumerate(f):
+        total += 1
+        line = raw.rstrip("\r\n")  # 跨平台行尾
+        if i < start:
+            continue
+        if limit is not None and len(selected) >= limit:
+            continue  # 窗口满了不存, 但继续数 total
+        selected.append(line)
+```
+
+50MB 文件 + Read(limit=100) 现在只占 100 行内存, 不是 50MB. total_lines 仍精确 (模型需要它来选下次 offset).
+
+跨平台行尾问题: Windows 的 `\r\n` 用 `rstrip("\n")` 会留 `\r`. 改 `rstrip("\r\n")`. (这是 04 splitlines() 隐式处理的, 流式版本得显式).
+
+### 优化 H: SYSTEM 精简
+
+**问题**: SYSTEM 累积到 3635 字符 ≈ 1200 token. 每次 LLM 调用都重复传, MiniMax 输入端按 ¥2/M 算, 每 turn 烧 ¥0.0024 在 SYSTEM 上.
+
+**怎么压**:
+
+- 多句陈述句改成单句祈使句 ("READ BEFORE WRITE: edit_file / apply_patch / ... requires a prior Read on it.")
+- 删掉"超过 200 行分块写"的段落 — 那是给 7B 写的, 对 M2.7 (输出预算大得多) 没用. 而且系统层有 chunked write 兜底, prompt 没必要再讲
+- (a)/(b)/(c)/(d) 四点禁令压成一行列出语言. 真正起约束作用的是系统层 detection, 不是 SYSTEM 文字
+
+**结果**: 3635 → 1739 字符, **砍 52%**, 每 turn 省 ~632 token. 5 turn 任务省 ¥0.006, 100 个任务/天省 ¥0.6.
+
+更重要的是 SYSTEM 现在**可读**了 — 下次再加新约束时, 不会因为它已经 3635 字符就不敢动.
+
+audit 验证关键短语没丢: WORKSPACE / PATH_ESCAPE / READ BEFORE WRITE / CONFLICT / apply_patch / todo / in_progress / TOOL-CALL PROTOCOL / ```bash / ```diff / RUN — 都在.
+
+---
+
+## 8. 安全脚手架 — .env 和 pre-commit hook
+
+接了 MiniMax 就要管密钥. 几个原则:
+
+### .env 模式
+
+- 所有密钥从 `os.environ.get(...)` 读, 不出现在源码里
+- `.env` 在 `.gitignore` 里, 永远不会 commit
+- `.env.example` 进 git, 给协作者看格式 (占位符, 没真值)
+- 写了一个 50 行的 `_load_dotenv()` (零依赖, 启动时自动读), 不引 `python-dotenv`
+
+```python
+def _load_dotenv(path: Path) -> None:
+    """读 .env 文件, 把 KEY=value 填进 os.environ — 但不覆盖已存在的环境变量."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        ...
+        if key and key not in os.environ:
+            os.environ[key] = value
+```
+
+设计选择: 已存在的环境变量优先 — shell 里 `set MINICODE_BACKEND=ollama` 能临时覆盖 .env 里的设置.
+
+### pre-commit hook
+
+`.git/hooks/pre-commit` 是个 bash 脚本, 扫 staged diff 里有没有常见密钥前缀:
+
+```bash
+PATTERN='(sk-api-|sk-ant-|sk-or-|sk-proj-|sk-svcacct-|AIza[0-9A-Za-z_-]{20,}|ghp_[0-9A-Za-z]{20,}|gho_[0-9A-Za-z]{20,}|xox[bp]-)'
+```
+
+发现就拒绝 commit, 给修法指引. 测试用 fake `sk-api-FAKE...` 验证过, 正确挡住.
+
+注意: hook 在 `.git/hooks/` 里, 是**每个 clone 独立**的. 别人 clone 你的仓库不会自动得到 — 这是 git 的设计 (出于安全考虑, hook 不进 repo). 如果想分发, 要么用 `husky` 类工具 (引依赖), 要么写个 `install_hooks.sh` 让用户主动跑. 我们目前接受 per-clone, 因为这是单人项目.
+
+### 这事的背景
+
+老实说, 这套防线是**从一次错误中学到的**: 我跑了 v5 接 MiniMax 那次, 用户在对话里**贴了真实密钥**两次. 我没办法把已经发出的对话撤回, 但可以保证未来不再发生 — `.env` + pre-commit hook + 代码永远从 env 读, 三层兜底.
+
+---
+
+## 9. 怎么跑起来
+
+### 默认 Ollama (本地, 零成本)
+
+需要先装 Ollama 桌面版 (`https://ollama.com/`), 拉默认模型:
+
+```bash
+ollama pull qwen2.5-coder:7b-instruct-q4_K_M
+```
+
+然后:
+
+```bash
 cd 05-session-and-streaming/
-pytest tests/
+python todo.py
 ```
 
-如果 pytest 在 entrypoint 加载阶段崩 (我们环境里 langsmith 插件就这样), 加这个环境变量绕过自动加载:
+启动 banner 显示 `backend: Ollama @ http://localhost:11434`.
 
-```sh
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/
-```
-
-### 会话中能用的命令
-
-| 命令 | 作用 |
-|---|---|
-| 任意非 `/` 开头的输入 | 作为消息发给 agent |
-| `/help` | 显示帮助 |
-| `/exit` | 退出 (等同于 Ctrl-D / Ctrl-C) |
-| `/clear` | 清空对话历史和 todo, 从头开始 |
-| `/todos` | 看当前待办列表 |
-| `/history` | 看消息条数统计 |
-| 生成中按 `Ctrl-C` | 中断当前轮但不退出 |
-
-### 想调点什么
-
-[todo.py](todo.py) 顶部几行就是全部旋钮:
-
-```python
-OLLAMA_BASE_URL = os.environ.get("MINICODE_OLLAMA_URL", "http://localhost:11434")
-MODEL_NAME      = os.environ.get("MINICODE_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
-REQUEST_TIMEOUT = int(os.environ.get("MINICODE_TIMEOUT", "300"))   # 秒
-WORKDIR         = Path.cwd()    # 工作目录 (启动时锁定)
-SYSTEM          = "..."         # 给模型看的系统提示词
-MAX_ROUNDS      = 20            # 单条用户消息最多跑几轮
-MAX_NEW_TOKENS  = 4096          # 单轮最多生成多少 token
-GREP_MAX_MATCHES = 200          # Grep 单次最多返回的匹配数
-LS_MAX_ENTRIES   = 500          # LS 单次最多列的条目数
-READ_MAX_CHARS   = 8000         # Read 单次最多返回的字符数
-```
-
----
-
-## 四、读源码的建议路线
-
-如果想搞懂内部, 按这个顺序看 [todo.py](todo.py) 最高效:
-
-1. **`repl` 函数** (文件接近末尾): 程序入口, REPL 怎么读输入、怎么拦截斜杠命令。
-2. **`ReActAgent.run` / `ReActAgent.step`**: agent 循环的核心 — Thought → Action → Observation, 把一条用户输入跑完整。
-3. **`ToolRegistry.dispatch`**: 工具调度 + 读后写守卫 (NOT_READ / CONFLICT). 锁的事全在这一个函数里。
-4. **`build_default_registry`**: 工具是怎么登记的 — 加新工具只改这里。
-5. **任意一个工具 handler** (比如 `tool_grep` 或 `tool_apply_patch`): 一个具体工具长什么样, 注意它怎么把所有异常封装成 `ToolResult.error(...)` 而不是抛出去。`apply_patch` 是 v4 新增, 演示了两阶段锁 + 原子回滚。
-6. **`OllamaClient` + `generate` + `_history_to_openai`**: HTTP 后端怎么把内部 `Message` 转成 Ollama 的 OpenAI 兼容请求, 又怎么把 `tool_calls` 拿回来。
-7. **`_parse_tool_arguments` / `split_think`**: 结构化 tool_calls 的 `arguments` 字段 Ollama 有时给 JSON 字符串、有时给 dict, 这里统一成 dict; `split_think` 负责剥离模型的 `<think>` 推理。
-
-整个文件没有用任何 agent 框架 — 你看到的就是真相, 没有黑盒。
-
-对应的测试在 [tests/test_tools.py](tests/test_tools.py): 想知道某个机制 (例如乐观锁) 该怎么表现, 直接看测试用例最快。
-
----
-
-## 五、测试
-
-工具层有 66 个 pytest, 覆盖 `ToolResult` / 4 个原子工具 / 读后写 + 乐观锁 / `edit_file` 错误分支 / `apply_patch` (解析 / 多文件 / 回滚 / NOT_READ / CONFLICT) / `todo` / `dispatch` 守卫 / 解析器。
-
-本地跑:
+### 切到 MiniMax (云端, 任务连续性好)
 
 ```bash
-cd 05-session-and-streaming
-pip install -r requirements-dev.txt
-pytest tests/
+# 1. 复制 .env 模板:
+cp .env.example .env
+
+# 2. 编辑 .env, 填:
+#    MINICODE_BACKEND=minimax
+#    MINIMAX_API_KEY=<你的 key, 从 https://platform.minimaxi.com/ 拿>
+
+# 3. (可选) 跑探针验证端点能用:
+python scripts/probe_minimax.py
+
+# 4. 跑:
+python todo.py
 ```
 
-CI 在 GitHub Actions 上每次 push / PR 自动跑, 见 [.github/workflows/test.yml](../.github/workflows/test.yml). v4 的运行时本来就只依赖 stdlib (Ollama 在另一个进程里), 所以 CI 不需要装任何 ML 栈, 只装 `pytest`。
+启动 banner 显示 `backend: MiniMax @ https://api.minimaxi.com`.
 
-如果本地遇到 `ModuleNotFoundError: requests_toolbelt` 之类的 pytest 插件报错, 用:
+`.env` 在 `.gitignore` 里, **永远不会被 commit**. pre-commit hook 也会扫密钥前缀挡住误操作.
 
-```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/
+切回 Ollama: 改 `.env` 的 `MINICODE_BACKEND=ollama` (或干脆删那行 — 默认就是 ollama).
+
+### 环境变量一览
+
+```
+MINICODE_BACKEND=ollama|minimax    # 选后端, 默认 ollama
+MINICODE_STREAM=1                  # 流式开关, 默认开 (设 0 强制非流式)
+MINICODE_TIMEOUT=300               # HTTP 超时秒数, 首次加载模型可能慢
+
+# Ollama
+MINICODE_OLLAMA_URL=http://localhost:11434
+MINICODE_MODEL=qwen2.5-coder:7b-instruct-q4_K_M
+
+# MiniMax
+MINIMAX_API_KEY=                   # 必填 (走 minimax 时)
+MINIMAX_BASE_URL=https://api.minimaxi.com   # 不要带 /v1, client 内部拼
+MINIMAX_MODEL=MiniMax-M2.7
+MINIMAX_PRICE_IN=2.0               # ¥/M token, 用于成本估算
+MINIMAX_PRICE_OUT=8.0
+```
+
+### REPL 命令
+
+```
+/help      显示帮助
+/exit      退出
+/clear     清空对话历史 (相当于 new_session)
+/todos     显示当前 todo 列表
+/history   显示消息条数统计
 ```
 
 ---
 
-## 六、开发中踩到的坑
+## 10. 已知问题 / 还能优化的地方
 
-这里记四条在 v4 开发里吃过亏、最后留下经验教训的真实问题。单元测试没抓住的,都是 E2E 跑起来才暴露的。
+诚实交代当前状态. 这些是真实存在但暂时没修的:
 
-### 1) unified diff 的空行是 hunk 结束符, 不是 context
+### 已知问题
 
-**现象**: 模型生成的 patch 形如 `--- a/a.py ... +x=2\n\n--- a/b.py ...` — 两个文件段之间有空行。apply_patch 返回 `HUNK_FAILED`, 文件一个都没改, 甚至新文件也没创建。
+**A. NAG_THRESHOLD = 3 对 M2.7 偏严**
 
-**根因**: 解析器把文件之间的空行当成了"一行空的 context"追加给前一个 hunk 的 `old_buf`, 于是期望匹配 `"x = 1\n"`, 而文件里实际是 `"x = 1"` (无尾换行), 匹配失败。
+老规则 "连续 3 轮没调 todo 就注入提醒" 是给 7B 的. M2.7 单步任务能力强, 不需要 todo, 被 NAG 注入提醒后没被带偏但提醒本身是噪声. 可改成"按 backend 区分阈值"或"模型 N 轮里有 1 轮调过 todo 就不 nag".
 
-**修法**: unified diff 规范里, 空行是 hunk 的**结束符**, 不是内容。把 `old_buf.append(""); new_buf.append("")` 改成 `break` 终结当前 hunk。
+**B. 模型选错工具时无系统层兜底**
 
-**教训**: 解析器一定要按格式规范写, 不要按"我觉得它应该怎样"写。单元测试当时用的都是"干净"的 diff (hunk 之间紧挨), 真实模型输出带空行才暴露。已补 3 个回归测试, 其中一个直接复刻 E2E 失败输入。
+7B 跑 query "解释 800-900 行" 时第一轮调了 `apply_patch` 传空 patch (用户从没要求修改). 系统层没拦, 空 patch 走 PARSE_FAILED 浪费一轮. 可加: tool_call 前置 sanity (apply_patch 的 patch 字段空 → 直接拒).
 
-### 2) 小模型会绕过 tool_calls 协议, SYSTEM 得一条一条堵
+**C. todo 状态机没强约束**
 
-**现象**: 模型不走 `tool_calls` 字段, 而是在 `content` 里写 ```` ```json\n{"name":"todo","arguments":[...]}\n``` ```` — 看起来在调工具, 实际是纯文本, 系统收不到任何工具调用, 流程卡住。堵掉 JSON 后, 模型又改用 ```` ```diff\n--- a/a.py\n... ``` ```` 直接贴 patch。
+一个 todo item 可以从 completed 变回 pending. 之前 7B 跑出"摆烂复读"的根因之一. state transitions 应当是单向 DAG: pending → in_progress → completed, 不能回退. 加状态转换校验即可.
 
-**修法**: SYSTEM 里加一节 **CRITICAL**, 明确禁止 (a) 用 ```` ```json ```` 块伪造工具调用, (b) 用 ```` ```diff ```/` ```` ```patch ```` 块贴补丁, (c) 任何其他把工具调用写成文本的形式; 并给正向指令"有 unified diff 就把它当作 `apply_patch` 的 `patch` 参数调用"。
+**D. 错误码命名不统一**
 
-**教训**: prompt 是软约束, 但对小模型这是唯一能加的约束 (结构层 Ollama 管不住 content)。禁令要具体、要带正向替代, 光说"不要那样做"模型会找别的通路绕。
+`NO_MATCH` vs `NOT_FOUND`、`BAD_ARGS` vs `BAD_REGEX`、`AMBIGUOUS` 含义不显. 模型容易搞混. 但改起来要同步改 README + 测试断言, 收益不大, 一直没做.
 
-### 3) 7B 在多步任务里会提前收手, 用 SYSTEM 兜底但不完美
+### 真新功能 (v6 候选)
 
-**现象**: todo 规划了 5 步, 模型做完第 2 步就回复"已完成第二步, 请确认"后停下, 不继续第 3 步。人工 "/继续" 后模型反而乱调 `Grep \d+` 把自己的源码刷屏 12000+ 字符, 再回复"I can't assist"。
+**E. Session 持久化**
 
-**修法**: SYSTEM 里加 MUST-continue 条款 — "每次成功 write/edit 之后, 如果原始用户请求还有剩余步骤, 必须继续; 不要只回复状态摘要, 直到所有 todo 项都 completed 再停"。
+跑 1 小时关掉 CLI 进度全丢. 加 `Session.to_dict()` / `from_dict()` + `/save name` / `/load name` 命令. ~80 行可做最简版.
 
-**教训**: 这条**并不能根除**, 是模型能力上限问题 (上下文越长 7B 越容易脱轨)。SYSTEM 把触发率降下来是值得做的; 根治得换 14B 或 32B。记在 §六 已知局限里, 诚实告知。
+**F. Context 压缩**
 
-### 4) apply_patch 的锁, 为什么挂在 handler 闭包里而不是 dispatch 层
+M2.7 有 200K context 暂时不紧, 但 Ollama 7B 是 32K, 长会话会撞墙. 滑动窗口最简单 (~50 行), 摘要复杂得多.
 
-**背景**: 其他写类工具 (`write_file` / `edit_file`) 的读后写 + 乐观锁都在 `ToolRegistry.dispatch` 里统一做 — 它从 `arguments["path"]` 拿路径, 查 `read_cache`, 验 NOT_READ / CONFLICT。一个地方, 一次到位。
+**G. 子 agent**
 
-**问题**: `apply_patch` 的参数是 `patch` (一整坨 unified diff), **没有单一的 `path`**。diff 里可能涉及 N 个文件, 每个文件是 create/modify/delete 里的一种。dispatch 层的通用钩子挂不上来。
+主 agent 派任务给子 agent, 子 agent 独立 session, 跑完返回摘要. Session 设计好了直接就能做, 但 7B 不适合做"派工的元认知". 留给云端模型 + 真实需求驱动时再做.
 
-**修法**: 把 `read_cache` 通过闭包注入 handler —
+**H. prompt caching**
 
-```python
-reg.register("apply_patch", handler=lambda patch: tool_apply_patch(patch, reg.read_cache))
-```
-
-handler 自己对 diff 里**每个被修改的文件**单独查 cache、验锁、然后两阶段提交 (先全部在内存里算出新内容并校验, 再统一落盘, 任一步失败就原子回滚已写文件)。
-
-**教训**: 通用机制有覆盖不到的特例时, 别硬套通用机制把代码搞丑; 让特例在自己的 handler 里做, 用闭包传它需要的上下文就够。dispatch 层仍然只做它能做的那份工作 — 单文件路径的统一守卫。
+MiniMax 是否支持 cache_control / 隐式自动 caching, 没确认. 如果支持, SYSTEM 重复传的成本能再砍一半. 需要专门测.
 
 ---
 
-## 七、已知局限
+## 11. 给后来者: 如果你想读源码
 
-诚实告知:
+[todo.py](todo.py) 一个文件 ~2000 行. 推荐阅读顺序:
 
-- **小模型 (默认 7B) 对长对话和复杂多步任务的稳定性有限**。如果它开始胡言乱语、跳步、或把工具调用写成文本代码块, 用 `/clear` 重开; 换更大的模型 (如 `qwen2.5-coder:14b`) 会明显改善多步规划稳定性。
-- **`input()` 是原生的**, 没有箭头键回看历史等舒适特性。
-- **bash 工具不在路径沙箱内**, 它能 `cd ..` 出工作区。原子工具 (LS/Glob/Grep/Read/write/append/edit) 都强制路径沙箱。
-- **Grep 的 Python 兜底版**对大仓库慢, 装 `ripgrep` 会快两个数量级。
-- **写后 cache 自动刷新**意味着模型可以连续 `edit_file` 同一文件而不必每次重新 Read — 这是体验权衡, 不是漏洞。仍然防外部并发修改 (CONFLICT 一样会触发)。
-- **乐观锁实际触发率不高**: 端到端测试中我们故意诱导模型不重 Read, 模型仍会下意识先 Read 一次, 让 cache 自动刷新。所以 CONFLICT 在真实使用里更多是"兜底防 IDE 自动保存 / git checkout / 其他终端"这种**模型不知道的外部修改**, 而不是防模型自己。pytest 里 `TestOptimisticLock` 直接调 dispatch 验证了机制本身。
-- **Windows 终端编码**: 我们强制 stdout 为 UTF-8, 但下游管道 / `tee` / 重定向到文件可能仍按系统默认 (GBK) 解码, 中文/box 字符会乱。需要时 `chcp 65001` 切码页或用 `> output.log` 后用 UTF-8 编辑器打开。
-- **`apply_patch` 不信任 hunk 头行号** (`@@ -N,M +N,M @@`), 仅用上下文行定位。好处是模型算错行号也能应用; 代价是上下文极少的纯插入 hunk 无法定位, 会报 `HUNK_FAILED`。
-- **每轮都重新把完整对话历史发给 Ollama**, 没做 prompt 缓存复用, 对话变长会让 Ollama 那边重新 prefill, 速度会下降。
-- **7B 模型的"任务规划连续性"有时会跳步**: 比如已经 `apply_patch` 成功了, 下一轮又去 `bash` 重做一次相同的修改。结果一般是幂等无害的, 但确实浪费一轮。这是模型能力问题, 不是循环 bug。
+1. **顶部配置 + .env loader** (~150 行) — 看懂 BACKEND / 环境变量怎么进来的
+2. **`ToolResult` + `Message` + `Tool` + `Session`** (~250 行) — 4 个核心数据结构
+3. **`_OpenAICompatClient` + `OllamaClient` + `MinimaxClient`** (~150 行) — HTTP + SSE + reassembly
+4. **`_StreamRenderer`** (~80 行) — 流式渲染细节, 关键陷阱注释里都有
+5. **`ToolRegistry.dispatch`** (~50 行) — _session 注入 + read-before-write 守卫
+6. **每个 tool_xxx 函数** — 平铺, 一个一个看, LS / Glob / Grep / Read / Write / Append / Edit / apply_patch
+7. **`apply_patch` 三阶段** — 这是工具层最复杂的一段. 见 04 README 也讲过
+8. **`ReActAgent.run` 主循环** — 把所有东西串起来
+
+每个段落顶部都有 `# ===` 边框 + 中文标题. 跟着边框扫就能看清结构.
+
+测试: [tests/test_tools.py](tests/test_tools.py) 66 个测试, 全部不依赖网络 / 模型, 跑 `pytest tests/` 一秒内出结果. 看测试比看代码更快理解工具的契约.
+
+探针: [scripts/](scripts/) 有 `probe_stream_v3.py` 测 SSE 协议、`probe_minimax.py` 测真 MiniMax 端点. 不进生产代码, 但**有用**——以后 backend 行为变了 (比如 Ollama 升级了流式协议), 跑探针就知道.
+
+---
+
+## 历史包袱: 04 / 03 / 02 / 01 都做了什么
+
+不在这份 README 重写 — 各自 README 仍然有效:
+
+- [04-structured-tool-calls/](../04-structured-tool-calls/) — Ollama 后端 + structured tool_calls + apply_patch + 66 个测试. 是当前 v5 的直接前身
+- [03-atomic-tools/](../03-atomic-tools/) — 三层工具架构 + 读后写乐观锁 + 42 个测试 + CI. 工具层第一次做扎实
+- [02-sandboxed/](../02-sandboxed/) — REPL + bash 沙箱探测 + 大文件分片写入. 从一次性脚本进化成日常工具
+- [01-bash-only/](../01-bash-only/) — 最小 ReAct + 5 个工具. 看清骨架最快
+
+按版本号往回读, 能看清 agent 是怎么从"能跑"长到"能用"的. 每一版只引入一两个新概念, 改动可控.
+
+---
+
+## 一句话总结
+
+**v5 不是加了什么新酷炫能力, 是把"用着别扭"的几个具体地方一个一个修了.** Session 让状态收口, 流式让等待变成观察, 双后端让 7B 不再是天花板, token 可见让花钱有数, 系统层兜底让 prompt 不再是孤军奋战.
+
+每件事都是有理由地做, 也都留了"做得不完美的地方"在 §10. 这是一个真实的迭代记录, 不是产品宣传.
