@@ -41,7 +41,7 @@
 | [02-sandboxed/](02-sandboxed/) | 加交互式 REPL + bash 沙箱探测 (排除 WSL System32, 避免 UTF-16 输出冲突) + 大文件分片写入 | 想看 agent 怎么演化成可用的日常工具 |
 | [03-atomic-tools/](03-atomic-tools/) | 三层工具架构 (LS/Glob/Grep/Read 原子层) + 读后写乐观锁 (mtime + size cache, NOT_READ / CONFLICT) + 42 个 pytest + GitHub Actions CI | 想看怎么把 agent 做扎实, 经得起测试 |
 | [04-structured-tool-calls/](04-structured-tool-calls/) | 后端换 Ollama HTTP (默认 `qwen2.5-coder:7b`, 能力跳档) + OpenAI 结构化 tool_calls + `apply_patch` 跨文件 unified diff (两阶段锁 + 原子回滚) + 66 个 pytest | 想看 agent 怎么从"能跑"演进到"跨文件原子改动" |
-| [05-wip/](05-wip/) | Session 状态管理 + 流式输出 + Ctrl-C 中断 + 双后端 (Ollama / MiniMax-M2.7 二选一) + token/成本可见 + 代码块伪 tool_call 系统层兜底 | 想看 agent 怎么从"能跑"长出"能用"的体感 |
+| [05-session-and-streaming/](05-session-and-streaming/) | Session 状态管理 + 流式输出 + Ctrl-C 中断 + 双后端 (Ollama / MiniMax-M2.7 二选一) + token/成本可见 + 代码块伪 tool_call 系统层兜底 | 想看 agent 怎么从"能跑"长出"能用"的体感 |
 
 每一版都只有一个 `todo.py` 文件 — **你看到的就是全部真相**, 没有任何框架包装。
 
