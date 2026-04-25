@@ -64,6 +64,13 @@ SYSTEM = textwrap.dedent(f"""\
     If a write fails with CONFLICT, the file changed externally — Read it
     again, then retry.
 
+    Reading specific line ranges: when the user asks about specific
+    lines in a file (e.g. "explain lines 800-900 of foo.py"), call
+    `Read` with `offset` and `limit` to fetch just that range, e.g.
+    Read(path='foo.py', offset=800, limit=100). Do NOT try to dump
+    the whole file via `bash` cat — large files truncate, you waste
+    tokens, and `Read` already returns line numbers built-in.
+
     For changes that span multiple files, or multiple edits in one file,
     prefer `apply_patch` with a unified diff — it applies atomically (all
     or nothing). Use `edit_file` for a single localized replacement.
@@ -1783,6 +1790,9 @@ class ReActAgent:
         )
 
     def run(self, query: str, max_rounds: int = MAX_ROUNDS) -> None:
+        # 每次 run 都把 codeblock 嘴硬计数归零 — 上一个 task 的累计不应惩罚下一个.
+        # (rounds_since_todo 同理由 turn 内逻辑自然管理, 这里不动)
+        self.session.codeblock_nag_count = 0
         self.history.append(Message.user(query))
         _box("▶ USER", query, char="═", color=C.USER)
 
@@ -1813,12 +1823,16 @@ class ReActAgent:
             if not res.actions:
                 # 系统层兜底: 无 tool_call + visible 里有 ```bash/```diff 等代码块,
                 # 八成是模型用文本伪装工具调用 (SYSTEM 已禁但 7B 偶尔嘴硬).
-                # 注入提醒, 给一次重做的机会; 连续 CODEBLOCK_NAG_LIMIT 次硬退出.
+                # 注入提醒, 给一次重做的机会; 累计 CODEBLOCK_NAG_LIMIT 次硬退出.
+                #
+                # 关键: counter 在本次 run() 内只增不减. 之前的版本"调任何 tool 都
+                # 重置", 结果模型用 dodge ↔ todo 摆烂的振荡把计数永远拖在 1, 跑满
+                # 20 轮上限. 现在 counter 累积 — 振荡也会触顶, GAVE UP 必生效.
                 if looks_like_dodged_tool_call(res.visible):
                     sess.codeblock_nag_count += 1
                     if sess.codeblock_nag_count > self.CODEBLOCK_NAG_LIMIT:
                         _box(
-                            f"⛔ GAVE UP (模型连续 {self.CODEBLOCK_NAG_LIMIT}+ 轮"
+                            f"⛔ GAVE UP (本会话累计 {sess.codeblock_nag_count} 次"
                             f"用代码块代替 tool_call, 硬退出)",
                             "", char="═", color=C.WARN,
                         )
@@ -1831,13 +1845,11 @@ class ReActAgent:
                     )
                     self.history.append(Message.user(_CODEBLOCK_REMINDER))
                     continue  # 跳过 DONE, 进下一轮重试
-                # 干净结束 — 重置 nag 计数器, 下次任务从 0 开始
-                sess.codeblock_nag_count = 0
                 _box("✅ DONE (无工具调用, 本轮结束)", "", char="═", color=C.DONE)
                 return
 
-            # 有 tool_call 走正常路径 — 也算"模型回到 tool_calls 协议", 重置 nag 计数器
-            sess.codeblock_nag_count = 0
+            # 有 tool_call 走正常路径. 注意: 这里不再清 codeblock_nag_count —
+            # 一次合法 tool_call 不能"洗白"前面的嘴硬, 否则模型用 todo 摆烂就能绕过.
             sess.rounds_since_todo = 0 if res.used_todo else sess.rounds_since_todo + 1
             print(f"{C.META}→ [3] rounds_since_todo = {sess.rounds_since_todo}"
                   f"{'  (本轮调用了 todo, 已重置)' if res.used_todo else ''}{C.RESET}")
