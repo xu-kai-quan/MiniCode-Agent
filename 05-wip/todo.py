@@ -34,6 +34,11 @@ from urllib.error import HTTPError, URLError
 OLLAMA_BASE_URL = os.environ.get("MINICODE_OLLAMA_URL", "http://localhost:11434")
 MODEL_NAME = os.environ.get("MINICODE_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
 REQUEST_TIMEOUT = int(os.environ.get("MINICODE_TIMEOUT", "300"))  # 秒, 首次加载模型可能慢
+# 流式输出开关. REPL 默认开 (体验), pytest 默认关 (确定性).
+# 设 MINICODE_STREAM=0 强制关.
+USE_STREAM = os.environ.get("MINICODE_STREAM", "1") != "0"
+# 流式 buffer 阈值: 累积到 \n 或超过这么多字符就刷一次. 太小屏幕会卡.
+STREAM_FLUSH_CHARS = 80
 WORKDIR = Path.cwd().resolve()
 SYSTEM = textwrap.dedent("""\
     You are a coding agent. Prefer the dedicated atomic tools
@@ -1310,12 +1315,162 @@ class OllamaClient:
         except (KeyError, IndexError) as e:
             raise RuntimeError(f"Unexpected Ollama response shape: {resp}") from e
 
+    def chat_stream(self, messages: list[dict], tools: list[dict] | None):
+        """流式版 chat — 按 SSE 协议逐行解析 Ollama 的增量 delta.
+
+        yield 出每个 delta 的 message 片段 (dict): 上层负责拼回完整 message.
+        典型 delta 形态:
+          {"content": "hello "}            # 文本 token
+          {"tool_calls": [{"index": 0, "id": "...", "function": {"name":"LS"}}]}
+          {"tool_calls": [{"index": 0, "function": {"arguments": "{\\""}}]}
+          {"tool_calls": [{"index": 0, "function": {"arguments": "path"}}]}
+          ...
+        最后通常一行 [DONE] 结束.
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
+        body = json.dumps(payload).encode("utf-8")
+        req = urlrequest.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        )
+        try:
+            resp = urlrequest.urlopen(req, timeout=self.timeout)
+        except HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Ollama HTTP {e.code}: {detail}") from e
+        except URLError as e:
+            raise RuntimeError(
+                f"Can't reach Ollama at {self.base_url}. "
+                f"Is the Ollama app running? ({e.reason})"
+            ) from e
+
+        # 用 with 确保异常 / KeyboardInterrupt 时连接也能关掉
+        with resp:
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                # SSE 格式: "data: {...}" 或空行 (心跳/分隔)
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue  # 容错: 偶发的格式不对就跳过, 不中断流
+                # OpenAI SSE 形态: choices[0].delta = {content?, tool_calls?, role?}
+                try:
+                    delta = chunk["choices"][0].get("delta") or {}
+                except (KeyError, IndexError):
+                    continue
+                if delta:
+                    yield delta
+
 
 def load_model() -> OllamaClient:
     client = OllamaClient()
     print(f"Using Ollama at {client.base_url}, model={client.model} "
           f"(timeout={client.timeout}s)", file=sys.stderr)
     return client
+
+
+# =================================================================
+# 流式渲染: 把 SSE delta 流拼成完整 message + 实时打印
+# =================================================================
+
+class _StreamRenderer:
+    """流式渲染器: 累积 content / tool_calls 同时往终端 flush 文本.
+
+    渲染策略 (与 Claude Code 行为对齐):
+    - content 文本累积到行边界 (\\n) 或 STREAM_FLUSH_CHARS 字符上限再刷, 避免逐 token
+      闪屏 (Windows 终端 + 中文 + ANSI 颜色组合下尤其卡).
+    - tool_calls 按 OpenAI 标准 reassembly (按 index 累加 arguments 分片), 完整后留给
+      上层一次性 _box 渲染. 不做 "分片预览" — 半截 JSON 显示意义不大.
+    - <think>...</think> 在流式期不做特殊染色 (跨 chunk 边界处理太脆), 等 finalize
+      后由 split_think 一次性剥离, 跟非流式语义一致.
+    - Ctrl-C: 让外层 (step) 捕获并把已收到的 partial 写进历史, 渲染器只负责 flush.
+    """
+
+    def __init__(self) -> None:
+        self.content_parts: list[str] = []        # 完整 content (供历史)
+        self.tool_calls: list[dict] = []          # 累积的 tool_calls (按 index)
+        self._buffer = ""                         # 待 flush 的文本
+
+    def feed(self, delta: dict) -> None:
+        """喂一个 delta. 文本按规则 flush; tool_calls 累积."""
+        text = delta.get("content")
+        if text:
+            self.content_parts.append(text)
+            self._buffer += text
+            self._flush_lines()
+
+        tcs = delta.get("tool_calls")
+        if tcs:
+            for tc in tcs:
+                self._merge_tool_call(tc)
+
+    def _merge_tool_call(self, tc: dict) -> None:
+        """OpenAI 流式 tool_calls: 按 index 合并 — name 一次给, arguments 分片拼."""
+        idx = tc.get("index", 0)
+        while len(self.tool_calls) <= idx:
+            self.tool_calls.append({"id": None, "function": {"name": None, "arguments": ""}})
+        slot = self.tool_calls[idx]
+        if tc.get("id"):
+            slot["id"] = tc["id"]
+        fn = tc.get("function") or {}
+        if fn.get("name"):
+            slot["function"]["name"] = fn["name"]
+        if "arguments" in fn:
+            slot["function"]["arguments"] += fn["arguments"] or ""
+
+    def _flush_lines(self) -> None:
+        """从 buffer 里把"完整行"或"超长片段"刷出去, 余下留给下次."""
+        while True:
+            nl = self._buffer.find("\n")
+            if nl >= 0:
+                chunk, self._buffer = self._buffer[: nl + 1], self._buffer[nl + 1:]
+                self._write(chunk)
+                continue
+            if len(self._buffer) >= STREAM_FLUSH_CHARS:
+                self._write(self._buffer)
+                self._buffer = ""
+                continue
+            break
+
+    def _write(self, s: str) -> None:
+        sys.stdout.write(C.ASSIST + s + C.RESET)
+        sys.stdout.flush()
+
+    def finalize(self) -> dict:
+        """流结束: 把残留 buffer 全 flush, 返回完整 message dict (与非流式 chat 同形)."""
+        if self._buffer:
+            self._write(self._buffer)
+            self._buffer = ""
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+        full_content = "".join(self.content_parts)
+        msg: dict[str, Any] = {"role": "assistant", "content": full_content}
+        valid_tool_calls = [
+            tc for tc in self.tool_calls
+            if tc.get("function", {}).get("name")
+        ]
+        if valid_tool_calls:
+            msg["tool_calls"] = [
+                {"id": tc["id"], "type": "function", "function": tc["function"]}
+                for tc in valid_tool_calls
+            ]
+        return msg
 
 
 def _history_to_openai(history: list[Message]) -> list[dict]:
@@ -1483,10 +1638,38 @@ class ReActAgent:
         """重新构造 session, 一步清空所有可变状态 (history / todo / read_cache)."""
         self.registry.session = Session.new(self.system_prompt)
 
+    def _call_llm(self) -> tuple[dict, bool]:
+        """调用模型, 返回 (assistant_message, interrupted).
+
+        USE_STREAM=True 时走 chat_stream + 实时打印; 否则走老的 chat 一次性返回.
+        Ctrl-C 期间已收到的 partial 也会作为 message 返回, 不丢.
+        """
+        messages = _history_to_openai(self.history)
+        tools = self.registry.schemas() or None
+
+        if not USE_STREAM:
+            return self.llm.chat(messages, tools), False
+
+        renderer = _StreamRenderer()
+        interrupted = False
+        try:
+            for delta in self.llm.chat_stream(messages, tools):
+                renderer.feed(delta)
+        except KeyboardInterrupt:
+            interrupted = True
+        msg = renderer.finalize()
+        if interrupted:
+            # finalize 先把 buffer 残留打完, 再提示中断 — 看起来更自然
+            print(f"{C.WARN}(interrupted by user — partial output kept){C.RESET}")
+        return msg, interrupted
+
     def step(self) -> StepResult:
-        msg = generate(self.llm, self.history, self.registry.schemas())
+        msg, interrupted = self._call_llm()
         raw_content = msg.get("content") or ""
         thought, visible = split_think(raw_content)
+        if interrupted:
+            # 给历史里的可见文本打个标记, 让模型下次知道上一轮被打断了.
+            visible = (visible + "\n[interrupted by user]").strip()
 
         raw_tool_calls = msg.get("tool_calls") or []
         actions: list[dict] = []
@@ -1500,6 +1683,10 @@ class ReActAgent:
                 "name": name,
                 "arguments": _parse_tool_arguments(fn.get("arguments")),
             })
+
+        # 被中断时不执行已经收到一半的 tool_calls — 安全第一, 不知道 arguments 是否完整.
+        if interrupted:
+            actions = []
 
         # 把 assistant 消息原样放回历史 — 保留 llama-cpp 给的 id, 后续 tool 消息配对.
         assistant_tool_calls: list[dict] | None = None
@@ -1541,13 +1728,16 @@ class ReActAgent:
 
         for turn in range(1, max_rounds + 1):
             print(f"\n{C.META}══════════ Turn {turn} ══════════{C.RESET}")
-            print(f"{C.META}→ [1] 调用模型 …{C.RESET}")
+            print(f"{C.META}→ [1] 调用模型 {'(streaming)' if USE_STREAM else '...'}{C.RESET}")
             res = self.step()
 
-            if res.thought:
-                _box("Thought (模型内部推理)", _short(res.thought, 1200), color=C.THOUGHT)
-            if res.visible:
-                _box("Assistant (可见输出)", res.visible, color=C.ASSIST)
+            # 流式: content 已经实时打印过 (含 <think>), 不再用 _box 重复展示.
+            # 非流式: 一次性返回, 这时 _box 是唯一展示路径.
+            if not USE_STREAM:
+                if res.thought:
+                    _box("Thought (模型内部推理)", _short(res.thought, 1200), color=C.THOUGHT)
+                if res.visible:
+                    _box("Assistant (可见输出)", res.visible, color=C.ASSIST)
             for i, a in enumerate(res.actions, 1):
                 _box(f"Action {i}/{len(res.actions)}: {a['name']}",
                      _fmt_args(a["arguments"]), color=C.ACTION)
