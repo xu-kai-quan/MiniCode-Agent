@@ -260,6 +260,8 @@ def _schema_from_signature(
     for pname, p in sig.parameters.items():
         if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             continue  # *args/**kwargs 不进 schema
+        if pname.startswith("_"):
+            continue  # _session 等内部参数: 由 dispatch 注入, 不暴露给模型
         if pname in exclude:
             continue
 
@@ -305,6 +307,51 @@ class ReadCache:
         self._entries.clear()
 
 
+class TodoManager:
+    """todo 列表的状态. 之前是模块级单例 TODO, 现在挂在 Session 上, 每个 session 独立."""
+
+    def __init__(self) -> None:
+        self.items: list[dict] = []
+
+    def update(self, items: list[dict]) -> ToolResult:
+        in_progress = sum(1 for it in items if it.get("status") == "in_progress")
+        if in_progress > 1:
+            return ToolResult.error(
+                "INVALID_STATE",
+                "Only one task can be in_progress at a time",
+            )
+        self.items = [
+            {"id": it["id"], "text": it["text"], "status": it.get("status", "pending")}
+            for it in items
+        ]
+        return ToolResult.success(self.render(), items=self.items)
+
+    def render(self) -> str:
+        mark = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+        if not self.items:
+            return "(no todos)"
+        return "\n".join(f"{mark[it['status']]} {it['text']}" for it in self.items)
+
+
+@dataclass
+class Session:
+    """一次 agent run 的全部可变状态.
+
+    把 history / todo / read_cache / 计数器集中到一个对象, 替代 04 散在
+    `agent.history` + 模块级 `TODO` + `registry.read_cache` 三处的状态.
+
+    new_session() 重新构造这个对象就等于"开新会话" — reset 所有状态一步到位.
+    """
+    history: list[Message]
+    todo: TodoManager = field(default_factory=TodoManager)
+    read_cache: ReadCache = field(default_factory=ReadCache)
+    rounds_since_todo: int = 0
+
+    @classmethod
+    def new(cls, system_prompt: str) -> "Session":
+        return cls(history=[Message.system(system_prompt)])
+
+
 # 写类工具集中在此. dispatch 用这个集合决定是否启用乐观锁检查.
 WRITE_TOOLS = frozenset({"write_file", "edit_file", "append_file"})
 
@@ -312,18 +359,34 @@ WRITE_TOOLS = frozenset({"write_file", "edit_file", "append_file"})
 class ToolRegistry:
     """工具表. 注册时同时登记 schema 和 handler — 加工具只改一处.
 
-    dispatch 还兼一个职责: 对写类工具做"读后写 + 乐观锁"检查.
-    检查在 handler 之前进行, 不污染 handler 的纯函数性.
+    dispatch 还兼两个职责:
+      1. 对写类工具做"读后写 + 乐观锁"检查 (用 self.session.read_cache);
+      2. 给 handler 注入 _session — handler 通过签名声明 `_session: Session`
+         即可拿到当前 session 引用 (apply_patch / todo 用得上, 其他工具不声明就不注入).
     """
 
-    def __init__(self, read_cache: ReadCache | None = None) -> None:
+    def __init__(self, session: Session | None = None) -> None:
         self._tools: dict[str, Tool] = {}
-        self.read_cache = read_cache or ReadCache()
+        # session 没传就 new 一个空 session — 单元测试里很常见
+        self.session = session if session is not None else Session.new("")
+        # 缓存 handler 是否需要 _session, 避免每次 dispatch 都 inspect 一遍
+        self._handler_takes_session: dict[str, bool] = {}
+
+    @property
+    def read_cache(self) -> ReadCache:
+        """向后兼容: 老代码可能直接拿 registry.read_cache."""
+        return self.session.read_cache
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"Tool already registered: {tool.name}")
         self._tools[tool.name] = tool
+        # 一次性查清楚 handler 要不要 _session
+        try:
+            sig = inspect.signature(tool.handler)
+            self._handler_takes_session[tool.name] = "_session" in sig.parameters
+        except (TypeError, ValueError):
+            self._handler_takes_session[tool.name] = False
 
     def names(self) -> list[str]:
         return list(self._tools)
@@ -352,7 +415,7 @@ class ToolRegistry:
         if not abs_path.exists():
             return None  # 新文件, 不需要先 Read
 
-        cached = self.read_cache.get(abs_path)
+        cached = self.session.read_cache.get(abs_path)
         if cached is None:
             return ToolResult.error(
                 "NOT_READ",
@@ -387,7 +450,7 @@ class ToolRegistry:
             abs_path = _safe_path(WORKDIR, path_str)
         except ValueError:
             return
-        self.read_cache.record(abs_path)
+        self.session.read_cache.record(abs_path)
 
     def dispatch(self, name: str, arguments: dict) -> ToolResult:
         """执行工具, 返回 ToolResult. 异常被吃掉转成 error result."""
@@ -399,8 +462,14 @@ class ToolRegistry:
         if guard is not None:
             return guard
 
+        # _session 注入: handler 声明了就传, 没声明就不传.
+        # 这样 8/10 的纯函数 handler 不感知 session, 只有 apply_patch/todo 等需要时才取.
+        call_kwargs = dict(arguments)
+        if self._handler_takes_session.get(name):
+            call_kwargs["_session"] = self.session
+
         try:
-            result = tool.handler(**arguments)
+            result = tool.handler(**call_kwargs)
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(str(result))
         except TypeError as e:
@@ -416,7 +485,7 @@ class ToolRegistry:
             if isinstance(path_str, str):
                 try:
                     abs_path = _safe_path(WORKDIR, path_str)
-                    self.read_cache._entries[str(abs_path)] = stat_info
+                    self.session.read_cache._entries[str(abs_path)] = stat_info
                 except ValueError:
                     pass
 
@@ -877,8 +946,12 @@ def _apply_hunks_to_text(text: str, hunks: list[_Hunk]) -> str:
     return "".join(out_parts)
 
 
-def tool_apply_patch(patch: str, read_cache: ReadCache) -> ToolResult:
-    """应用 unified diff. 两阶段: 预检锁 + 解析 → 构造新内容 → 一次性写盘 + 回滚."""
+def tool_apply_patch(patch: str, _session: Session) -> ToolResult:
+    """应用 unified diff. 两阶段: 预检锁 + 解析 → 构造新内容 → 一次性写盘 + 回滚.
+
+    _session 由 dispatch 自动注入 (handler 签名声明就给, 名字以下划线开头不进 schema).
+    """
+    read_cache = _session.read_cache
     try:
         file_patches = _parse_unified_diff(patch)
     except ValueError as e:
@@ -1061,34 +1134,12 @@ class TerminalTool:
 
 
 # =================================================================
-# Todo (规划工具)
+# Todo handler (TodoManager 类已在 Session 之前定义, 此处只是 tool handler)
 # =================================================================
 
-class TodoManager:
-    def __init__(self) -> None:
-        self.items: list[dict] = []
-
-    def update(self, items: list[dict]) -> ToolResult:
-        in_progress = sum(1 for it in items if it.get("status") == "in_progress")
-        if in_progress > 1:
-            return ToolResult.error(
-                "INVALID_STATE",
-                "Only one task can be in_progress at a time",
-            )
-        self.items = [
-            {"id": it["id"], "text": it["text"], "status": it.get("status", "pending")}
-            for it in items
-        ]
-        return ToolResult.success(self.render(), items=self.items)
-
-    def render(self) -> str:
-        mark = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
-        if not self.items:
-            return "(no todos)"
-        return "\n".join(f"{mark[it['status']]} {it['text']}" for it in self.items)
-
-
-TODO = TodoManager()
+def tool_todo(items: list[dict], _session: Session) -> ToolResult:
+    """更新 todo 列表. _session 由 dispatch 注入, 取出 session 上的 TodoManager."""
+    return _session.todo.update(items)
 
 
 # =================================================================
@@ -1112,8 +1163,8 @@ _TODO_ITEMS_SCHEMA = {
 }
 
 
-def build_default_registry(terminal: TerminalTool) -> ToolRegistry:
-    reg = ToolRegistry()
+def build_default_registry(terminal: TerminalTool, session: Session | None = None) -> ToolRegistry:
+    reg = ToolRegistry(session=session)
 
     # ---- 原子工具 (主链路) ----
     reg.register(Tool.from_function(
@@ -1173,13 +1224,11 @@ def build_default_registry(terminal: TerminalTool) -> ToolRegistry:
             "modified. Prefer this over multiple edit_file calls when changes span files "
             "or a single file has multiple edits."
         ),
-        # handler 闭包 reg.read_cache; schema 从 tool_apply_patch 反射, 但排除 read_cache.
-        handler=lambda patch: tool_apply_patch(patch, reg.read_cache),
+        # _session 由 dispatch 注入, 反射默认排除 _ 前缀参数, 模型看不到.
         param_docs={"patch": "Unified diff text. Paths may use 'a/' and 'b/' prefixes."},
-        exclude={"read_cache"},
     ))
     reg.register(Tool.from_function(
-        TODO.update, name="todo",
+        tool_todo, name="todo",
         description=(
             "Write the full todo list. Pass every item each call. "
             "Statuses: pending, in_progress (at most one), completed."
@@ -1417,14 +1466,23 @@ class ReActAgent:
     ) -> None:
         self.llm = llm
         self.registry = registry
-        self.history: list[Message] = [Message.system(system_prompt)]
-        self.rounds_since_todo = 0
+        self.system_prompt = system_prompt
+        # registry 自带 session — agent 不另起一个, 防止 dispatch 注入的 session
+        # 跟 agent.history 不同步 (单一权威源). agent 把自己的 system_prompt
+        # 写进 session.history[0], 替换掉 registry 默认 session 里的占位 system.
+        registry.session.history = [Message.system(system_prompt)]
 
-    def reset(self) -> None:
-        self.history = [Message.system(self.history[0].content)]
-        self.rounds_since_todo = 0
-        TODO.items.clear()
-        self.registry.read_cache.clear()
+    @property
+    def session(self) -> Session:
+        return self.registry.session
+
+    @property
+    def history(self) -> list[Message]:
+        return self.session.history
+
+    def new_session(self) -> None:
+        """重新构造 session, 一步清空所有可变状态 (history / todo / read_cache)."""
+        self.registry.session = Session.new(self.system_prompt)
 
     def step(self) -> StepResult:
         msg = generate(self.llm, self.history, self.registry.schemas())
@@ -1506,16 +1564,17 @@ class ReActAgent:
                 _box("✅ DONE (无工具调用, 本轮结束)", "", char="═", color=C.DONE)
                 return
 
-            self.rounds_since_todo = 0 if res.used_todo else self.rounds_since_todo + 1
-            print(f"{C.META}→ [3] rounds_since_todo = {self.rounds_since_todo}"
+            sess = self.session
+            sess.rounds_since_todo = 0 if res.used_todo else sess.rounds_since_todo + 1
+            print(f"{C.META}→ [3] rounds_since_todo = {sess.rounds_since_todo}"
                   f"{'  (本轮调用了 todo, 已重置)' if res.used_todo else ''}{C.RESET}")
-            if self.rounds_since_todo >= self.NAG_THRESHOLD:
+            if sess.rounds_since_todo >= self.NAG_THRESHOLD:
                 _box("⚠️  NAG", f"连续 {self.NAG_THRESHOLD} 轮未调用 todo, 注入提醒",
                      color=C.WARN)
                 self.history.append(Message.user(
                     "<reminder>Update your todos.</reminder>"
                 ))
-                self.rounds_since_todo = 0
+                sess.rounds_since_todo = 0
 
         _box("⛔ MAX ROUNDS", f"达到 {max_rounds} 轮上限, 强制退出本轮",
              char="═", color=C.WARN)
@@ -1585,11 +1644,11 @@ def repl() -> None:
                 print(HELP)
                 continue
             if cmd == "clear":
-                agent.reset()
+                agent.new_session()
                 print("(history cleared)")
                 continue
             if cmd == "todos":
-                print(TODO.render())
+                print(agent.session.todo.render())
                 continue
             if cmd == "history":
                 counts: dict[str, int] = {}
