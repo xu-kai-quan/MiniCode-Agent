@@ -109,77 +109,41 @@ WORKDIR = Path.cwd().resolve()
 SYSTEM = textwrap.dedent(f"""\
     You are a coding agent.
 
-    WORKSPACE: you are operating inside this directory:
-      {WORKDIR}
-    All path arguments to tools are RESOLVED relative to that
-    workspace. Pass relative paths like 'todo.py', 'src/foo.py',
-    'tests/', or '.' for the workspace root. NEVER pass absolute
-    paths (`/path/to/...`, `C:\\Users\\...`, `/usr/local/...`) — the
-    sandbox will reject them with PATH_ESCAPE. If you don't know
-    what's in the workspace, call `LS` with no args (or `LS('.')`)
-    first to look around.
+    WORKSPACE: {WORKDIR}
+    All tool path arguments are RELATIVE to this workspace. Pass paths
+    like 'todo.py', 'src/foo.py', '.'. Absolute paths (/path/...,
+    C:\\..., /usr/...) get rejected with PATH_ESCAPE. When unsure what's
+    here, call LS first.
 
-    Prefer the dedicated atomic tools
-    (LS, Glob, Grep, Read) over `bash` — they return structured,
-    predictable results. Use `bash` only for operations no atomic tool
-    covers: running git, executing scripts, package managers, etc.
+    TOOL PREFERENCE: prefer atomic tools (LS, Glob, Grep, Read) over
+    bash — they return structured, predictable results. Use bash only
+    for git, scripts, package managers, anything atomic tools don't cover.
 
-    Read-before-write: before edit_file, apply_patch, or before
-    write_file/append_file on an EXISTING file, you must call Read first.
-    Creating a brand-new file with write_file does not require a prior Read.
-    If a write fails with CONFLICT, the file changed externally — Read it
-    again, then retry.
+    READ BEFORE WRITE: edit_file / apply_patch / write_file / append_file
+    on an EXISTING file requires a prior Read on it. Brand-new files
+    don't. CONFLICT means the file changed externally — Read again then
+    retry.
 
-    Reading specific line ranges: when the user asks about specific
-    lines in a file (e.g. "explain lines 800-900 of foo.py"), call
-    `Read` with `offset` and `limit` to fetch just that range, e.g.
-    Read(path='foo.py', offset=800, limit=100). Do NOT try to dump
-    the whole file via `bash` cat — large files truncate, you waste
-    tokens, and `Read` already returns line numbers built-in.
+    LINE RANGES: for "lines 800-900 of foo.py" call Read(path='foo.py',
+    offset=800, limit=100). Read returns line numbers built-in. Do NOT
+    cat the whole file — large files truncate and waste tokens.
 
-    For changes that span multiple files, or multiple edits in one file,
-    prefer `apply_patch` with a unified diff — it applies atomically (all
-    or nothing). Use `edit_file` for a single localized replacement.
+    MULTI-FILE / MULTI-EDIT: prefer apply_patch (unified diff, atomic
+    all-or-nothing). edit_file is for one localized replacement.
 
-    For any task with more than one step, call the `todo` tool first to
-    plan, then keep it updated as you work. Exactly one item should be
-    `in_progress` at a time.
+    PLANNING: tasks with more than one step — call todo first, keep it
+    updated, exactly one item in_progress at a time. After a successful
+    write/edit, if more steps remain, continue — don't stop with a
+    summary mid-task.
 
-    After every successful write/edit, if the original user request has
-    more steps, you MUST continue — do not reply with just a status
-    summary until all todo items are completed.
-
-    For files longer than ~200 lines, write in chunks: start with
-    `write_file` for the first chunk, then call `append_file` repeatedly
-    for each remaining chunk (roughly 150 lines per chunk), preserving
-    newlines. Reply with a final message only when no more tool calls
-    are needed.
-
-    CRITICAL — tool-call protocol: when you want to invoke a tool, emit
-    it as a real structured tool_call (the OpenAI `tool_calls` field).
-    NEVER put the call into your text reply in ANY of these forms:
-    (a) a JSON object inside a ```json code block;
-    (b) a ```diff, ```patch, or any other code block containing the raw
-    content that was supposed to be a tool argument — a unified diff IS
-    the `patch` argument of the `apply_patch` tool, not a substitute for
-    calling it;
-    (c) a ```bash, ```sh, or ```shell code block containing a command
-    you intend to run — that command IS the `command` argument of the
-    `bash` tool. Putting it in a code block does not execute it;
-    (d) any other visible text representation of a tool name + arguments.
-
-    The distinction that matters: are you trying to RUN something or
-    SHOW something? If RUN — call the tool. Code blocks in your reply
-    only count as "showing example code to the user" (e.g. answering
-    "how would I write this in Python?"). Code blocks NEVER trigger
-    execution — there is no other path to action besides tool_calls.
-
-    If your message contains tool-call content as visible text, the
-    system will treat it as a final reply, no tool will run, and the
-    task will stall. In particular:
-    - Have a unified diff ready? CALL `apply_patch` with it as `patch`.
-    - Want to run a shell command? CALL `bash` with it as `command`.
-    Do not print the diff or the command. Call the tool.
+    TOOL-CALL PROTOCOL (critical): when invoking a tool, emit a real
+    structured tool_call. NEVER write the call as visible text — not as
+    ```json, ```diff, ```patch, ```bash, ```sh, or any other code block
+    containing what should have been a tool argument. The system treats
+    text replies as final answers; nothing runs. RUN means tool_call;
+    code blocks only SHOW example code to the user. Have a diff ready?
+    Call apply_patch. Want to run a shell command? Call bash. Don't print
+    them.
 """).strip()
 MAX_ROUNDS = 20
 MAX_NEW_TOKENS = 4096
@@ -838,7 +802,12 @@ def tool_grep(pattern: str, path: str = ".", ignore_case: bool = False,
 
 
 def tool_read(path: str, limit: int | None = None, offset: int = 0) -> ToolResult:
-    """带行号读取. limit 是用户契约 → success; 字符上限是系统兜底 → partial."""
+    """带行号读取. limit 是用户契约 → success; 字符上限是系统兜底 → partial.
+
+    流式实现 (优化 G): 用 file.iter() 逐行读, 只在内存持有 limit 行的窗口.
+    无 limit 时仍要扫全文 — 模型可能真要全文; 但极少触发, 触发也是模型有意为之.
+    用这种实现, 50MB 文件 + Read(limit=100) 只占 100 行内存, 不再 OOM.
+    """
     try:
         p = _safe_path(WORKDIR, path)
     except ValueError as e:
@@ -848,16 +817,26 @@ def tool_read(path: str, limit: int | None = None, offset: int = 0) -> ToolResul
     if not p.is_file():
         return ToolResult.error("NOT_A_FILE", f"Path '{path}' is not a file")
 
+    start = max(0, offset)
+    selected: list[str] = []   # 落在 [start, start+limit) 窗口里的行
+    total = 0                  # 文件总行数 — 一直数到 EOF
+
     try:
         st = p.stat()
-        all_lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            for i, raw in enumerate(f):
+                total += 1
+                line = raw.rstrip("\r\n")  # 跨平台: Windows \r\n / Unix \n 都剥掉
+                if i < start:
+                    continue
+                if limit is not None and len(selected) >= limit:
+                    # 窗口已满, 但要继续读到 EOF 才能给出 total — 不再 append
+                    continue
+                selected.append(line)
     except OSError as e:
         return ToolResult.error("READ_FAILED", str(e))
 
-    total = len(all_lines)
-    start = max(0, offset)
-    end = total if limit is None else min(total, start + limit)
-    selected = all_lines[start:end]
+    end = start + len(selected)
 
     numbered = "\n".join(f"{i + 1:6d}\t{line}" for i, line in enumerate(selected, start=start))
     char_capped = len(numbered) > READ_MAX_CHARS
