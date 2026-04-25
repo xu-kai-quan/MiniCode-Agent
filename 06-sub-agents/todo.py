@@ -117,6 +117,9 @@ CHARS_PER_TOKEN_EST = 3
 SUB_AGENT_MAX_ROUNDS = int(os.environ.get("MINICODE_SUB_MAX_ROUNDS", "10"))
 # 子 agent 整体超时 (秒). 防止跑死锁住主流程.
 SUB_AGENT_TIMEOUT = int(os.environ.get("MINICODE_SUB_TIMEOUT", "300"))
+# spawn_agent 返回 text 里 diff 截断阈值. 太大撑爆 context, 太小用户看不全.
+# 真 diff 完整保留在 data["diff"] 里, 这里只截 text 显示部分.
+SUB_AGENT_DIFF_MAX_CHARS = int(os.environ.get("MINICODE_SUB_DIFF_MAX", "4000"))
 
 WORKDIR = Path.cwd().resolve()
 SYSTEM = textwrap.dedent(f"""\
@@ -193,6 +196,13 @@ SYSTEM = textwrap.dedent(f"""\
       assistant: [direct: Read(hello.py), then edit_file or apply_patch]
       (No "试" / "try" — user wants the change committed directly.)
 
+    SHOWING THE DIFF TO USER: when reporting spawn_agent's diff back
+    to the user, DO NOT wrap it in a ```diff or ```patch code block
+    — that triggers the system's dodge-detection (which thinks you're
+    pasting a diff instead of calling apply_patch). Show the diff as
+    plain indented text or quote it line-by-line with leading "│ ".
+    The user can read it just fine without code-block syntax highlighting.
+
     When NOT to use sub-agent: user wants the change committed (no
     "试/try"), pure read/explore tasks (Read/Grep/LS suffice), or
     multi-step planning tasks (use todo).
@@ -222,6 +232,12 @@ SUB_AGENT_SYSTEM_TEMPLATE = textwrap.dedent("""\
 
     All path arguments are RELATIVE to the worktree above. Same rules as
     a normal agent for read-before-write, atomic apply_patch, etc.
+
+    YOU ARE ALREADY AT THE WORKTREE — your cwd is exactly the workspace
+    above. Do NOT `cd` into it from bash; just call commands directly:
+    `pytest`, `python script.py`, etc. The bash tool runs with cwd = the
+    worktree. Never use `cd /tmp/minicode-sub-...` — the system already
+    placed you there.
 
     OUTPUT: keep your final reply terse — it becomes a tool_result for
     the parent. State the outcome in one or two sentences:
@@ -517,10 +533,13 @@ class Session:
     # 跟踪有多少 turn 的 token 数是估算的 (对 ollama 流式恒为 True, 对 minimax 看运气)
     estimated_turns: int = 0
     exact_turns: int = 0
+    # v6: 标识这个 session 是否是子 agent 的. 子 agent 不该被 todo NAG 打扰
+    # (它根本没 todo 工具, NAG 提醒是噪音). 主 agent 此值默认 False.
+    is_subagent: bool = False
 
     @classmethod
-    def new(cls, system_prompt: str) -> "Session":
-        return cls(history=[Message.system(system_prompt)])
+    def new(cls, system_prompt: str, is_subagent: bool = False) -> "Session":
+        return cls(history=[Message.system(system_prompt)], is_subagent=is_subagent)
 
 
 # 写类工具集中在此. dispatch 用这个集合决定是否启用乐观锁检查.
@@ -1454,7 +1473,7 @@ def tool_spawn_agent(task: str, _session: Session) -> ToolResult:
     #    简化处理: monkey-patch 模块级 WORKDIR, 跑完恢复. 不优雅但可工作.
     #    (彻底解决要把 WORKDIR 进 Session, 那是 v7 的事 — 见 README §10)
     WORKDIR = worktree
-    sub_session = Session.new(sub_system)
+    sub_session = Session.new(sub_system, is_subagent=True)
     try:
         # 子 agent 的 terminal 也要在 worktree 里跑命令
         sub_terminal = TerminalTool(worktree)
@@ -1492,13 +1511,24 @@ def tool_spawn_agent(task: str, _session: Session) -> ToolResult:
     _session.prompt_tokens_total += sub_tokens[0]
     _session.completion_tokens_total += sub_tokens[1]
 
-    # 7) 组合返回 — text 给主 agent 看 (摘要 + 关键统计), data 给程序读 (diff + 路径)
+    # 7) 组合返回 — text 给主 agent 看 (摘要 + 关键统计 + 真 diff), data 给程序读
+    # 关键: 真 diff 必须进 text. 之前只放 data 里, 模型看不到, 跟用户报告时只能编 diff.
+    file_count = diff.count("+++") if diff else 0
     text_parts = [
         f"sub-agent finished. {summary}",
-        f"diff: {diff_lines} line(s) changed across {diff.count('+++') if diff else 0} file(s).",
+        f"diff: {diff_lines} line(s) changed across {file_count} file(s).",
     ]
+    if diff:
+        # 截断到 SUB_AGENT_DIFF_MAX_CHARS 防止巨 diff 撑爆 context
+        diff_preview = diff[:SUB_AGENT_DIFF_MAX_CHARS]
+        if len(diff) > SUB_AGENT_DIFF_MAX_CHARS:
+            diff_preview += (
+                f"\n... (diff truncated, {len(diff) - SUB_AGENT_DIFF_MAX_CHARS} "
+                f"more chars in result.data.diff)"
+            )
+        text_parts.append(f"\nFull diff (use this verbatim if user wants to apply):\n{diff_preview}")
     if keep_path:
-        text_parts.append(f"worktree retained for inspection: {keep_path}")
+        text_parts.append(f"\nworktree retained for inspection: {keep_path}")
     if sub_tokens[0] + sub_tokens[1] > 0:
         text_parts.append(
             f"sub-agent tokens: {_fmt_k(sub_tokens[0])} in + {_fmt_k(sub_tokens[1])} out"
@@ -2432,7 +2462,8 @@ class ReActAgent:
             sess.rounds_since_todo = 0 if res.used_todo else sess.rounds_since_todo + 1
             print(f"{C.META}→ [3] rounds_since_todo = {sess.rounds_since_todo}"
                   f"{'  (本轮调用了 todo, 已重置)' if res.used_todo else ''}{C.RESET}")
-            if sess.rounds_since_todo >= self.NAG_THRESHOLD:
+            # 子 agent 没 todo 工具 — todo NAG 对它毫无意义, 跳过.
+            if sess.rounds_since_todo >= self.NAG_THRESHOLD and not sess.is_subagent:
                 _box("⚠️  NAG", f"连续 {self.NAG_THRESHOLD} 轮未调用 todo, 注入提醒",
                      color=C.WARN)
                 self.history.append(Message.user(
