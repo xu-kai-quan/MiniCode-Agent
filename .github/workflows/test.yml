@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        dir: [01-bash-only, 02-sandboxed, 03-atomic-tools, 04-structured-tool-calls, 05-session-and-streaming, 06-sub-agents]
+        dir: [01-bash-only, 02-sandboxed, 03-atomic-tools, 04-structured-tool-calls, 05-session-and-streaming, 06-sub-agents, 07-session-persistence]
     defaults:
       run:
         working-directory: ${{ matrix.dir }}

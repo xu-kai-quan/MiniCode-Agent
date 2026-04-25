@@ -1,0 +1,8 @@
+# MiniCode Agent v4 — runtime dependencies (Ollama backend)
+#
+# 核心: 只用 stdlib 调 Ollama HTTP, 无需 Python 侧包.
+# 前置: 装 Ollama 桌面版 https://ollama.com/download, 启动后再
+#   ollama pull qwen2.5-coder:7b-instruct-q4_K_M
+#
+# Dev / test only — uncomment if you intend to run `pytest tests/`
+# pytest>=8
