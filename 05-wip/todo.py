@@ -40,8 +40,20 @@ USE_STREAM = os.environ.get("MINICODE_STREAM", "1") != "0"
 # 流式 buffer 阈值: 累积到 \n 或超过这么多字符就刷一次. 太小屏幕会卡.
 STREAM_FLUSH_CHARS = 80
 WORKDIR = Path.cwd().resolve()
-SYSTEM = textwrap.dedent("""\
-    You are a coding agent. Prefer the dedicated atomic tools
+SYSTEM = textwrap.dedent(f"""\
+    You are a coding agent.
+
+    WORKSPACE: you are operating inside this directory:
+      {WORKDIR}
+    All path arguments to tools are RESOLVED relative to that
+    workspace. Pass relative paths like 'todo.py', 'src/foo.py',
+    'tests/', or '.' for the workspace root. NEVER pass absolute
+    paths (`/path/to/...`, `C:\\Users\\...`, `/usr/local/...`) — the
+    sandbox will reject them with PATH_ESCAPE. If you don't know
+    what's in the workspace, call `LS` with no args (or `LS('.')`)
+    first to look around.
+
+    Prefer the dedicated atomic tools
     (LS, Glob, Grep, Read) over `bash` — they return structured,
     predictable results. Use `bash` only for operations no atomic tool
     covers: running git, executing scripts, package managers, etc.
@@ -520,7 +532,15 @@ class ToolRegistry:
 def _safe_path(workdir: Path, p: str) -> Path:
     path = (workdir / p).resolve()
     if not path.is_relative_to(workdir):
-        raise ValueError(f"Path escapes workspace: {p}")
+        # 错误消息直接告诉模型怎么修 — 比单纯说"escapes" 让模型不至于放弃.
+        # README §三 4 提过 7B 在错误后容易"任务放弃", 把可操作建议放进错误本身是
+        # 最直接的兜底.
+        raise ValueError(
+            f"Path '{p}' is outside the workspace ({workdir}). "
+            f"Use a path RELATIVE to the workspace — e.g. 'todo.py', "
+            f"'src/foo.py', or '.' for the workspace root. "
+            f"If you don't know what's there, call LS with no arguments first."
+        )
     return path
 
 
