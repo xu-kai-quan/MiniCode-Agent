@@ -1,8 +1,48 @@
-# 05-wip — 下一轮迭代的起点 (派生自 04-structured-tool-calls)
+# 05-wip — v5 迭代起点 (派生自 04-structured-tool-calls)
 
-> 这一份是 04 的精确副本, 作为 v5 迭代的工作基线. 还没有任何 04 之外的改动.
-> 下文仍是 v4 的内容 (本地 Ollama 驱动的交互式编码助手, MiniCode Agent v4),
-> 等 v5 主题确定后再批量更新.
+> 这一份从 04 派生, 持续叠加新能力. v5 主题逐渐成形 — 优先做"能力宽度":
+> Session 状态管理、流式输出、云端后端、token 成本可见. 等 v5 主题完全
+> 收敛后会重命名为 `05-<topic>` (类似 04 从 atomic-tools 改名 structured-tool-calls).
+
+## v5 相对 v4 的新增能力
+
+| 能力 | 说明 |
+|---|---|
+| **Session 状态管理** | history / todo / read_cache / 计数器统一进 `Session` 对象, 删掉模块级 TODO 全局变量, 多 agent 实例不再共享状态. `agent.new_session()` 一行清空. |
+| **流式输出** | REPL 中边生成边显示, 不再等 5-30 秒看不到状态. tool_call 完整 reassembly + Ctrl-C 中断 + partial 内容入历史. 详见 §流式与中断. |
+| **双后端** | `MINICODE_BACKEND=ollama\|minimax` 切换. Ollama 本地零成本, MiniMax-M2.7 云端任务连续性显著好 (7B 在多步任务上有能力上限). 详见 §后端与启用. |
+| **Token / 成本可见** | 每个 turn 末尾显示 `tokens: X in + Y out = Z`; MiniMax 后端额外显示 `≈ ¥XX.XXXX` 估算成本. session 收尾给总计. |
+| **代码块伪 tool_call 兜底** | 模型把 ```bash/```diff/```json 等代码块当 tool 调用时 (7B 常发病), 系统层注入提醒 + 累计 2 次硬退出, 不再死循环. |
+| **PATH_ESCAPE 错误更可操作** | 错误消息直接给出"用相对路径"+ 例子 + LS 兜底建议, 模型不容易在错误后放弃. |
+| **SYSTEM 包含 workspace 路径** | 启动时把 cwd 注入 SYSTEM, 模型不再瞎猜路径. |
+
+## 后端与启用
+
+默认走本地 Ollama (零成本、断网可用、跑 7B). 想用云端大模型 (M2.7, 任务连续性好得多) 就切 minimax:
+
+```bash
+# 1) 复制 .env 模板:
+cp .env.example .env
+
+# 2) 编辑 .env, 填你的 MiniMax key (api: https://platform.minimaxi.com):
+#    MINICODE_BACKEND=minimax
+#    MINIMAX_API_KEY=sk-api-xxxxx
+
+# 3) (可选) 跑探针验证端点能用:
+python scripts/probe_minimax.py
+```
+
+`.env` 在 `.gitignore` 里, 永远不会被 commit. 仓库根的 `.git/hooks/pre-commit` 会扫常见密钥前缀 (`sk-api-` / `sk-ant-` / `ghp_` / `AIza` 等) 阻止 commit, 万一手滑也能挡住.
+
+切回 Ollama: `MINICODE_BACKEND=ollama` (或干脆删 `.env` 那行).
+
+## 流式与中断
+
+REPL 默认流式. 模型生成时文本边出边显示, 按行边界 + 80 字符上限刷新 (避免 Windows 终端逐 token 闪屏). tool_call 等完整 arguments 拼齐再用 `_box` 渲染, 不做半截 JSON 预览.
+
+Ctrl-C 中途打断: 已收到的 partial content 进 history (带 `[interrupted by user]` 标记), 半截 tool_call 不执行 (避免拿不完整 arguments 调工具).
+
+设 `MINICODE_STREAM=0` 强制非流式 (pytest / 脚本场景).
 
 ---
 
