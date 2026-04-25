@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,46 +35,52 @@ OLLAMA_BASE_URL = os.environ.get("MINICODE_OLLAMA_URL", "http://localhost:11434"
 MODEL_NAME = os.environ.get("MINICODE_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
 REQUEST_TIMEOUT = int(os.environ.get("MINICODE_TIMEOUT", "300"))  # 秒, 首次加载模型可能慢
 WORKDIR = Path.cwd().resolve()
-SYSTEM = (
-    "You are a coding agent. Prefer the dedicated atomic tools "
-    "(LS, Glob, Grep, Read) over `bash` — they return structured, "
-    "predictable results. Use `bash` only for operations no atomic tool "
-    "covers: running git, executing scripts, package managers, etc. "
-    "Read-before-write: before edit_file, apply_patch, or before "
-    "write_file/append_file on an EXISTING file, you must call Read first. "
-    "Creating a brand-new file with write_file does not require a prior Read. "
-    "If a write fails with CONFLICT, the file changed externally — Read it "
-    "again, then retry. "
-    "For changes that span multiple files, or multiple edits in one file, "
-    "prefer `apply_patch` with a unified diff — it applies atomically (all "
-    "or nothing). Use `edit_file` for a single localized replacement. "
-    "For any task with more than one step, call the `todo` tool first to "
-    "plan, then keep it updated as you work. Exactly one item should be "
-    "`in_progress` at a time. "
-    "After every successful write/edit, if the original user request has "
-    "more steps, you MUST continue — do not reply with just a status "
-    "summary until all todo items are completed. "
-    "For files longer than ~200 lines, write in chunks: start with "
-    "`write_file` for the first chunk, then call `append_file` repeatedly "
-    "for each remaining chunk (roughly 150 lines per chunk), preserving "
-    "newlines. Reply with a final message only when no more tool calls "
-    "are needed. "
-    "CRITICAL — tool-call protocol: when you want to invoke a tool, emit "
-    "it as a real structured tool_call (the OpenAI `tool_calls` field). "
-    "NEVER put the call into your text reply in ANY of these forms: "
-    "(a) a JSON object inside a ```json code block; "
-    "(b) a ```diff, ```patch, or any other code block containing the raw "
-    "content that was supposed to be a tool argument — a unified diff IS "
-    "the `patch` argument of the `apply_patch` tool, not a substitute for "
-    "calling it; "
-    "(c) any other visible text representation of a tool name + arguments. "
-    "If your message contains tool-call content as visible text, the "
-    "system will treat it as a final reply, no tool will run, and the "
-    "task will stall. Text is for talking to the user; tool_calls are "
-    "for doing work. In particular: if you have a unified diff ready, "
-    "CALL `apply_patch` with that diff as the `patch` argument. Do not "
-    "print the diff."
-)
+SYSTEM = textwrap.dedent("""\
+    You are a coding agent. Prefer the dedicated atomic tools
+    (LS, Glob, Grep, Read) over `bash` — they return structured,
+    predictable results. Use `bash` only for operations no atomic tool
+    covers: running git, executing scripts, package managers, etc.
+
+    Read-before-write: before edit_file, apply_patch, or before
+    write_file/append_file on an EXISTING file, you must call Read first.
+    Creating a brand-new file with write_file does not require a prior Read.
+    If a write fails with CONFLICT, the file changed externally — Read it
+    again, then retry.
+
+    For changes that span multiple files, or multiple edits in one file,
+    prefer `apply_patch` with a unified diff — it applies atomically (all
+    or nothing). Use `edit_file` for a single localized replacement.
+
+    For any task with more than one step, call the `todo` tool first to
+    plan, then keep it updated as you work. Exactly one item should be
+    `in_progress` at a time.
+
+    After every successful write/edit, if the original user request has
+    more steps, you MUST continue — do not reply with just a status
+    summary until all todo items are completed.
+
+    For files longer than ~200 lines, write in chunks: start with
+    `write_file` for the first chunk, then call `append_file` repeatedly
+    for each remaining chunk (roughly 150 lines per chunk), preserving
+    newlines. Reply with a final message only when no more tool calls
+    are needed.
+
+    CRITICAL — tool-call protocol: when you want to invoke a tool, emit
+    it as a real structured tool_call (the OpenAI `tool_calls` field).
+    NEVER put the call into your text reply in ANY of these forms:
+    (a) a JSON object inside a ```json code block;
+    (b) a ```diff, ```patch, or any other code block containing the raw
+    content that was supposed to be a tool argument — a unified diff IS
+    the `patch` argument of the `apply_patch` tool, not a substitute for
+    calling it;
+    (c) any other visible text representation of a tool name + arguments.
+    If your message contains tool-call content as visible text, the
+    system will treat it as a final reply, no tool will run, and the
+    task will stall. Text is for talking to the user; tool_calls are
+    for doing work. In particular: if you have a unified diff ready,
+    CALL `apply_patch` with that diff as the `patch` argument. Do not
+    print the diff.
+""").strip()
 MAX_ROUNDS = 20
 MAX_NEW_TOKENS = 4096
 
@@ -372,11 +379,6 @@ class ToolRegistry:
         # 缓存 handler 是否需要 _session, 避免每次 dispatch 都 inspect 一遍
         self._handler_takes_session: dict[str, bool] = {}
 
-    @property
-    def read_cache(self) -> ReadCache:
-        """向后兼容: 老代码可能直接拿 registry.read_cache."""
-        return self.session.read_cache
-
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"Tool already registered: {tool.name}")
@@ -464,12 +466,11 @@ class ToolRegistry:
 
         # _session 注入: handler 声明了就传, 没声明就不传.
         # 这样 8/10 的纯函数 handler 不感知 session, 只有 apply_patch/todo 等需要时才取.
-        call_kwargs = dict(arguments)
-        if self._handler_takes_session.get(name):
-            call_kwargs["_session"] = self.session
-
         try:
-            result = tool.handler(**call_kwargs)
+            if self._handler_takes_session.get(name):
+                result = tool.handler(_session=self.session, **arguments)
+            else:
+                result = tool.handler(**arguments)
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(str(result))
         except TypeError as e:
@@ -1126,10 +1127,8 @@ class TerminalTool:
                 text + f"\n... (output truncated, {len(full) - BASH_MAX_CHARS} more chars)",
                 **data,
             )
-        if r.returncode != 0:
-            # 命令跑了但失败 — 用 success 比 error 更准确, 模型能从 exit_code 看出.
-            # error 留给"工具本身没跑成"的情况.
-            return ToolResult.success(text, **data)
+        # 命令跑了但 exit!=0 也算 success — error 只留给"工具本身没跑成"的情况.
+        # 模型能从 exit_code 看出命令是否成功.
         return ToolResult.success(text, **data)
 
 
