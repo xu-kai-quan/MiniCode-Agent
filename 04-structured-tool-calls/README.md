@@ -1,4 +1,4 @@
-# 04-atomic-tools — 本地 Ollama 驱动的交互式编码助手 (MiniCode Agent v4)
+# 04-structured-tool-calls — 本地 Ollama 驱动的交互式编码助手 (MiniCode Agent v4)
 
 [![tests](https://github.com/xu-kai-quan/MiniCode-Agent/actions/workflows/test.yml/badge.svg)](https://github.com/xu-kai-quan/MiniCode-Agent/actions/workflows/test.yml)
 
@@ -262,7 +262,7 @@ v4 走 **OpenAI 兼容的结构化 `tool_calls`** (Ollama 的 `/v1/chat/completi
 进到**你希望它工作的目录** (所有文件操作都被锁在启动时的 pwd 里), 然后:
 
 ```sh
-python path/to/04-atomic-tools/todo.py
+python path/to/04-structured-tool-calls/todo.py
 ```
 
 横幅出现后, 在 `>` 后面输入你想让它做的事。
@@ -272,14 +272,14 @@ python path/to/04-atomic-tools/todo.py
 如果你只想跑一个任务就退出, 直接传命令行参数:
 
 ```sh
-python path/to/04-atomic-tools/todo.py "把 hello.py 改成带类型提示的版本"
+python path/to/04-structured-tool-calls/todo.py "把 hello.py 改成带类型提示的版本"
 ```
 
 ### 跑测试
 
 ```sh
 pip install -r requirements-dev.txt
-cd 04-atomic-tools/
+cd 04-structured-tool-calls/
 pytest tests/
 ```
 
@@ -345,7 +345,7 @@ READ_MAX_CHARS   = 8000         # Read 单次最多返回的字符数
 本地跑:
 
 ```bash
-cd 04-atomic-tools
+cd 04-structured-tool-calls
 pip install -r requirements-dev.txt
 pytest tests/
 ```
