@@ -1393,8 +1393,10 @@ def _git_worktree_create(main_workdir: Path) -> Path:
     要求 main_workdir 是 git repo (有 .git 且至少一个 commit). 否则抛 RuntimeError
     并附带可操作的引导 (含 .gitignore 模板防止 .env 被 commit).
 
-    创建成功后立刻写 worktree 局部的 .git/info/exclude, 排除常见 build 垃圾,
-    让后续 git diff 只显示真改动.
+    创建成功后**不动 worktree 的 .gitignore** — 排除 build 垃圾的工作放在
+    _git_worktree_diff 里用 pathspec exclude 做. 这样 spawn_agent 不留下任何
+    "我们自己造的"修改 (之前往 .gitignore 追加导致 .gitignore 修改本身出现在
+    diff 里, 用户看到一坨跟任务无关的 .gitignore 变更, 是个真烦的瑕疵).
     """
     if not (main_workdir / ".git").exists():
         # 升级为可操作错误 — 教用户怎么做, 而不是只说"missing .git"
@@ -1435,58 +1437,65 @@ def _git_worktree_create(main_workdir: Path) -> Path:
             pass
         raise RuntimeError(f"git worktree add failed: {(r.stderr or '').strip()}")
 
-    # 创建成功 → 在 worktree 根写 .gitignore, 排除常见 build 垃圾.
-    # 关键发现 (实测): worktree 的 .git/info/exclude 不被尊重 (git worktree
-    # 的 gitdir 下 info/ 不在 git 的 read 路径里). 必须用 worktree 根的
-    # .gitignore 文件. 文件本身会被 ls-files 列出来 — 我们在排除列表里
-    # 也把 .gitignore 自己排掉, 让它从 diff 里消失.
-    try:
-        gitignore_path = sub_dir / ".gitignore"
-        # 如果原本 worktree 已经有 .gitignore (因为 commit 里就有), 不覆盖,
-        # 改成追加我们的额外条目. 否则新建.
-        existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
-        if "# minicode spawn_agent" not in existing:
-            addition_lines = ["# minicode spawn_agent: ignore build/cache/secrets in diff"]
-            addition_lines.extend(_WORKTREE_EXCLUDE_PATTERNS)
-            # 把 .gitignore 文件自己也排掉, 避免它出现在 diff 里
-            addition_lines.append(".gitignore")
-            addition = "\n" + "\n".join(addition_lines) + "\n"
-            gitignore_path.write_text(existing + addition, encoding="utf-8")
-    except OSError:
-        # 写失败不致命 — diff 会带噪音, 但 worktree 仍可用
-        pass
-
+    # 注意: 不写 .gitignore. 之前版本会追加 _WORKTREE_EXCLUDE_PATTERNS 到
+    # worktree 的 .gitignore, 但那个"追加"本身是改动, 会出现在 diff 里 ——
+    # 用户看到一段跟任务无关的 .gitignore 变更, 真烦. 现在改用 pathspec
+    # exclude 在 _git_worktree_diff 里过滤, 不动磁盘上任何文件.
     return sub_dir
+
+
+def _build_pathspec_excludes() -> list[str]:
+    """把 _WORKTREE_EXCLUDE_PATTERNS 转成 git pathspec 的 exclude 形式.
+
+    git pathspec exclude 语法: ':(exclude,glob)<pattern>'
+    - exclude: 反向匹配
+    - glob: 用 shell 风格的 glob (* / **) 匹配, 而不是 git 自家的 fnmatch
+
+    注意 _WORKTREE_EXCLUDE_PATTERNS 里有的是目录 ('__pycache__/'), 有的是 glob
+    ('*.pyc'). 都按 glob 处理, 目录用 '**/dirname/**' 形式让所有层级生效.
+    """
+    specs = []
+    for p in _WORKTREE_EXCLUDE_PATTERNS:
+        if p.endswith("/"):
+            # 目录: 任意层级下 dirname/* 都排除
+            dirname = p.rstrip("/")
+            specs.append(f":(exclude,glob)**/{dirname}/**")
+            specs.append(f":(exclude,glob){dirname}/**")  # 顶层
+        else:
+            # 文件 glob (e.g. *.pyc / .env)
+            specs.append(f":(exclude,glob)**/{p}")
+            specs.append(f":(exclude,glob){p}")  # 顶层
+    return specs
 
 
 def _git_worktree_diff(worktree: Path) -> str:
     """跑 git diff HEAD 拿到子 agent 的全部改动 (含 untracked 新建文件).
 
     要让新文件出现在 diff 里, 必须 git add -N (intent-to-add). 但 `git add -N .`
-    会绕过 .gitignore + .git/info/exclude — 把所有 untracked 都强制加进去.
-    我们要的是只加"非 ignored 的 untracked", 所以先用 ls-files 拿这个列表
-    (它尊重 ignore 规则), 再逐个 add -N.
+    会绕过 .gitignore — 把所有 untracked 都强制加进去. 用 ls-files 拿"非 ignored
+    untracked", 再 add -N. 同时**两个步骤都加 pathspec exclude**, 显式排除
+    build/cache/secrets — 不依赖磁盘上 .gitignore 文件 (避免我们造的 .gitignore
+    修改本身污染 diff).
     """
-    # 1) 列出 untracked 但 NOT ignored 的文件 (尊重 .gitignore + .git/info/exclude)
+    excludes = _build_pathspec_excludes()
+    # 1) 列出 untracked + 不是 ignored + 不在我们的 exclude 列表里
     ls = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard"],
+        ["git", "ls-files", "--others", "--exclude-standard", "--"] + excludes,
         cwd=str(worktree), capture_output=True, text=True, timeout=30,
         encoding="utf-8", errors="replace",
     )
     if ls.returncode == 0:
         files_to_add = [f for f in (ls.stdout or "").splitlines() if f.strip()]
-        # 2) 逐个 git add -N (即使是 ignored 文件路径也不会被 add 因为 -N 还是会
-        #    检查 ignore 规则? 其实不会 — 显式 add 会绕过. 但我们已经过滤了 ignored,
-        #    所以这里安全)
         if files_to_add:
+            # 2) 逐个 git add -N (intent-to-add) — 显式列文件, 不会被 ignore 拦
             subprocess.run(
                 ["git", "add", "-N", "--"] + files_to_add,
                 cwd=str(worktree), capture_output=True, text=True, timeout=30,
                 encoding="utf-8", errors="replace",
             )
-    # 3) git diff HEAD — 已 tracked 文件的改动 + 新加为 intent-to-add 的内容
+    # 3) git diff HEAD — 同样加 pathspec exclude, 防 tracked 的 .pyc 之类的被显示
     r = subprocess.run(
-        ["git", "diff", "HEAD"],
+        ["git", "diff", "HEAD", "--"] + excludes,
         cwd=str(worktree), capture_output=True, text=True, timeout=30,
         encoding="utf-8", errors="replace",
     )

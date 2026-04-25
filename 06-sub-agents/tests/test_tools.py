@@ -936,3 +936,36 @@ class TestSpawnAgent:
         assert ".gitignore" in msg, "error msg should include .gitignore step"
         assert ".env" in msg, "error msg should warn about .env"
         assert "__pycache__" in msg or "pyc" in msg, "error msg should mention build artifacts"
+
+    def test_spawn_agent_does_not_modify_gitignore(self, monkeypatch, git_workspace):
+        """spawn_agent 不该往 worktree 的 .gitignore 写东西.
+
+        之前实测发现: 老版本会在 worktree 的 .gitignore 追加 exclude patterns,
+        但那个追加本身是改动, 出现在 diff 里 — 用户看到一段跟任务无关的
+        .gitignore 修改, 真烦. 修法: 改用 pathspec exclude, 完全不动磁盘文件.
+        """
+        # 让主 workspace 已经有一个 .gitignore (常见场景)
+        gi = git_workspace / ".gitignore"
+        gi.write_text("# user's existing gitignore\n*.log\n")
+        import subprocess as _sp
+        _sp.run(["git", "add", ".gitignore"], cwd=git_workspace, capture_output=True, check=True)
+        _sp.run(["git", "commit", "-m", "add gitignore"], cwd=git_workspace, capture_output=True, check=True)
+
+        # 子 agent 只做一个真改动
+        fake = _FakeSubAgentLLM([
+            ("write_file", {"path": "x.txt", "content": "x\n"}),
+        ])
+        monkeypatch.setattr(M, "_SPAWN_LLM", fake)
+        monkeypatch.setattr(M, "USE_STREAM", False)
+
+        terminal = M.TerminalTool(git_workspace)
+        registry = M.build_default_registry(terminal)
+        r = registry.dispatch("spawn_agent", {"task": "make x.txt"})
+
+        assert r.status == "success", f"got error: {r.text}"
+        diff = r.data["diff"]
+        # 真改动应当在
+        assert "x.txt" in diff
+        # .gitignore 不应当出现在 diff 里 (我们没动它)
+        assert ".gitignore" not in diff, \
+            f".gitignore should NOT appear in diff (we use pathspec, not file edits):\n{diff}"
