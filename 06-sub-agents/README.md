@@ -1,797 +1,700 @@
-# 06-sub-agents — 在隔离 git worktree 里跑探索式子任务
+# 06-sub-agents — 派子 agent 在隔离 worktree 里"试一下"
 
 [![tests](https://github.com/xu-kai-quan/MiniCode-Agent/actions/workflows/test.yml/badge.svg)](https://github.com/xu-kai-quan/MiniCode-Agent/actions/workflows/test.yml)
 
-> 状态: **alpha / wip**. 在 05 基础上加了 spawn_agent 工具. 73 个 pytest 测试 (继承 05 的 66 + 7 个 spawn_agent 新测试). README 仍在写, 顶部这段是 v6 摘要, 下面继承 05 README 的全部内容仍然适用.
->
-> 当前活跃版本. 05 已封存为快照. 后续工作都在这里.
+> 状态: **alpha**, 当前活跃版本. 工具层 76 个 pytest (66 继承 05 + 10 spawn_agent 专项). 一个文件 [todo.py](todo.py), 约 2300 行.
 
-## 06 跟 05 的区别 — 一句话版本
-
-**05 是单 agent + 流式 + 双后端. 06 加了 spawn_agent — 在隔离 git worktree 里派子 agent 跑探索式任务.**
-
-### 实际场景
-
-用户问: "我想把 foo.py 里的 X 改成 Y, 但不知道测试还能不能过. 试一下"
-
-主 agent 工作流:
-
-```
-spawn_agent(task="apply this experimental diff to foo.py, run pytest, report PASS/FAIL")
-  ↓
-[在临时 git worktree 里]
-  子 agent: apply_patch → bash pytest → "PASS — 37/37 tests passed"
-  ↓
-返回 ToolResult:
-  text: "sub-agent finished. PASS — 37/37 tests passed.
-         diff: 12 line(s) changed across 1 file(s).
-         sub-agent tokens: 800 in + 250 out"
-  data:
-    diff: "<unified diff>"      ← 主 agent 可以 apply 到主 workspace
-    worktree: null               ← 成功了 worktree 已清理
-    sub_history_len: 8
-    sub_tokens: (800, 250)
-  ↓
-主 agent 回报用户 + 询问是否采纳
-  ↓
-用户: "采纳"
-  ↓
-主 agent: apply_patch(patch=spawn_result.diff)  ← 真正改主 workspace
-```
-
-### 关键设计选择 (跟用户对齐后定的)
-
-| 项 | 选择 | 理由 |
-|---|---|---|
-| 隔离机制 | git worktree (要求 git repo) | 比全拷贝快 (秒级), 自带 git 状态隔离 |
-| Worktree 路径 | `tempfile.mkdtemp(prefix='minicode-sub-')` | 跨平台, 自动管理 |
-| 同步等还是后台 | 同步等 + 5 分钟超时 | 简单, REPL 体验可接受 |
-| 子 agent backend | 继承主 agent | 共用 LLM 客户端 + 后端选择 |
-| 失败 worktree | 保留供调试 (路径在 result data 里) | 出错时能 cd 进去看 |
-| 成功 worktree | 自动清理 | 不堆积 |
-| 深度限制 | 1 (子 agent 工具集不含 spawn_agent) | 防 7B 递归爆炸 |
-| 子 agent 没有 todo 工具 | 单一目标, 不需要规划 | 减少认知干扰 |
-
-### 已知限制
-
-- **要求主 workspace 是 git 仓库**. 不在 git repo 里跑 → spawn_agent 报 `WORKTREE_FAILED` 并提示 `git init`
-- **同步阻塞**: 子 agent 跑 5 分钟主 agent 就卡 5 分钟. 无法并行多个子 agent
-- **WORKDIR 在子 agent 期间被 monkey-patch** — 子 agent 跑期间 module-level WORKDIR 临时指向 worktree, 跑完恢复. 不优雅但可工作. 真正干净的做法是把 WORKDIR 进 Session, 那是 v7 的事
-- **7B 模型不适合判断"什么时候该派子 agent"** — SYSTEM 写了"只用于 TRY without polluting", 但 7B 很可能为了简单查代码也派子 agent. M2.7 表现应该好得多
-
-### v6 跟之前所有版本一样, 主链路功能保留
-
-下面 (从"它跟 04 的区别"开始) 是 05 README 全文 — 仍然适用. v6 在 05 之上**只加了 spawn_agent**, 其他全部继承.
+这是 MiniCode Agent 第 6 版. 在 05 的基础上加一件事: **`spawn_agent` 工具** —— 让主 agent 派子 agent 在隔离的 git worktree 里跑探索式任务, 不污染主 workspace.
 
 ---
 
-这是 MiniCode Agent 第 5 版 (现在升级到 v6, 加了子 agent). 一个文件 [todo.py](todo.py), 大约 2300 行 Python. 跑起来给你一个 `>` 提示符, 你跟它说"帮我建个项目"或者"看一下 todo.py 第 800 行解释一下", 它就动手干。
+## 它跟 05 的区别 — 一句话版本
 
-## 它跟 04 的区别 — 一句话版本
+**05 已经能用. 06 解决"想试个改动但不愿先在主 workspace 改"的具体痛点.**
 
-**04 能跑, 05 能用**.
+05 跑得好, 但有个特定场景它解不好: 你想"试试这个改动通不通过测试", 又不想真改主代码. 用户必须自己手动:
+1. `git stash` 或者备份当前状态
+2. 跟 agent 说"改 foo.py 第 5 行, 跑 pytest"
+3. 看结果
+4. 如果不行, `git checkout .` 或手动恢复
+5. 如果行, 留下改动
 
-04 工程上已经合格 (原子工具、apply_patch 跨文件原子改动、66 个测试). 但实际用起来有几个让人想关掉它的地方:
+**这个 dance 烦, 而且容易在第 4 步漏一些 .pyc 之类的临时文件**. 06 的 `spawn_agent` 把整个 dance 移到一个工具调用里:
 
-- 等了 30 秒屏幕没动, 不知道是死了还是在思考
-- 7B 模型在多步任务里经常脱轨, 死循环 19 轮才超时退出
-- 本地 7B 跑长任务的连续性确实不如云端大模型, 但 04 没法切换
-- 跑一次任务不知道用了多少 token, 云端按 token 收费时心里没底
-- 多 agent 实例共享模块级全局变量, 状态串台
+```
+用户: "试一下把 foo.py 第 5 行改成 X, 跑 pytest 看通不通过"
+主 agent: spawn_agent(task="apply this change, run pytest, report PASS/FAIL")
+  ↓ [子 agent 在 /tmp/minicode-sub-XXX (HEAD 的 git worktree) 里跑]
+  ↓ edit_file → bash pytest → 报告
+主 agent: 拿到子 agent 的报告 + unified diff
+  → 询问用户 "结果是 FAIL — 要把这个 diff apply 到主 workspace 吗?"
+用户: "不要" / "要"
+```
 
-05 一个一个修. 这份 README 重点讲**每件事是为什么做、怎么做、起没起效果**. 不是技术参考, 是过程记录.
+**主 workspace 全程没动**. 子 agent 跑完, worktree 自动清掉 (失败时保留供调试).
 
 ---
 
 ## 目录
 
-- [1. Session — 把散落的状态收回来](#1-session--把散落的状态收回来)
-- [2. 流式输出 — 看见模型在思考](#2-流式输出--看见模型在思考)
-- [3. 双后端 — Ollama 和 MiniMax 之间切](#3-双后端--ollama-和-minimax-之间切)
-- [4. Token 和成本可见 — 不再黑盒烧钱](#4-token-和成本可见--不再黑盒烧钱)
-- [5. 代码块伪 tool_call — 系统层把 prompt 兜不住的接住](#5-代码块伪-tool_call--系统层把-prompt-兜不住的接住)
-- [6. PATH_ESCAPE 错误信息 — 不让模型在错误后放弃](#6-path_escape-错误信息--不让模型在错误后放弃)
-- [7. 流式 Read 和 SYSTEM 精简 — 两个事后优化](#7-流式-read-和-system-精简--两个事后优化)
-- [8. 安全脚手架 — .env 和 pre-commit hook](#8-安全脚手架--env-和-pre-commit-hook)
-- [9. 怎么跑起来](#9-怎么跑起来)
-- [10. 已知问题 / 还能优化的地方](#10-已知问题--还能优化的地方)
-- [11. 给后来者: 如果你想读源码](#11-给后来者-如果你想读源码)
+- [1. 为什么不直接在主 workspace 改](#1-为什么不直接在主-workspace-改)
+- [2. 怎么实现 — 5 个核心设计选择](#2-怎么实现--5-个核心设计选择)
+- [3. 工作流走一遍 — 实测真录](#3-工作流走一遍--实测真录)
+- [4. 修复迭代 — 5 次实测发现的真问题](#4-修复迭代--5-次实测发现的真问题)
+- [5. 跑起来长什么样](#5-跑起来长什么样)
+- [6. spawn_agent 的工具层细节](#6-spawn_agent-的工具层细节)
+- [7. 怎么跑](#7-怎么跑)
+- [8. 读源码的建议路线](#8-读源码的建议路线)
+- [9. 已知局限](#9-已知局限)
+- [10. v6 → v7 候选方向](#10-v6--v7-候选方向)
 
 ---
 
-## 1. Session — 把散落的状态收回来
+## 1. 为什么不直接在主 workspace 改
 
-### 04 是什么样
+agent 默认行为是直接改 disk. 这对"我要写个新文件" / "把这个 bug 修了" 这种**已决策的任务**完全合适. 但有一类任务**本质上是探索式的**:
 
-04 的可变状态散在三个地方:
+- "试试用 X 替换 Y 看测试还能不能通过"
+- "看看把这个函数拆成两个会怎样"
+- "尝试用 A 库代替 B 库, 跑一下"
 
-```python
-# 模块顶层全局
-TODO = TodoManager()
+这些任务**用户希望先看结果再决定要不要**. 如果直接改主 workspace:
 
-# agent 实例上
-class ReActAgent:
-    def __init__(self, ...):
-        self.history: list[Message] = [...]
-        self.rounds_since_todo = 0
+- 失败了要回滚, agent 必须自己记住改了什么 (它**会忘**)
+- 中间状态可能让其他工具 (IDE / git / pytest) 看到一坨半成品
+- 用户没机会"看一眼 diff 再决定"
 
-# registry 实例上
-class ToolRegistry:
-    def __init__(self, ...):
-        self.read_cache = ReadCache()
-```
+**spawn_agent 的设计意图就是把这个"探索 → 看结果 → 决策" 的循环显式化**. 不再依赖 agent 的记忆和自律, 改成结构化的:
 
-要"清空当前会话从头开始", 得三处都 reset:
+1. 派子 agent 在**隔离的 git worktree** 里干
+2. 子 agent 跑完, 系统自动**算 diff** 返回
+3. 主 agent 把 diff 给用户看, **询问是否采纳**
+4. 用户决策 → 主 agent 用 `apply_patch` 把 diff 真应用到主 workspace
 
-```python
-def reset(self):
-    self.history = [Message.system(...)]
-    self.rounds_since_todo = 0
-    TODO.items.clear()              # 全局变量, 别忘了
-    self.registry.read_cache.clear() # 另一个对象上的, 也别忘了
-```
-
-### 这有什么问题
-
-不是"代码风格不好"那种问题, 是**真问题**:
-
-1. **模块级 `TODO` 是全进程共享的** — 同一个 Python 进程跑两个 agent 实例, 它们的 todo 列表会互相污染. 单进程 REPL 看不出来, 但写测试的时候就麻烦
-2. **状态散三处, reset 必漏** — 加新的状态字段时, 你得记得改 reset(). 反例: 加个 codeblock_nag_count 在 agent 上, reset 时容易忘记清, 串到下次任务
-3. **没法表达"不同会话"** — 想做"这次跑用这个 system prompt, 下次跑换一个", 没有清晰的边界
-
-### 怎么改
-
-把所有可变状态封进一个 dataclass:
-
-```python
-@dataclass
-class Session:
-    history: list[Message]
-    todo: TodoManager = field(default_factory=TodoManager)
-    read_cache: ReadCache = field(default_factory=ReadCache)
-    rounds_since_todo: int = 0
-    codeblock_nag_count: int = 0
-    prompt_tokens_total: int = 0
-    completion_tokens_total: int = 0
-    # ... 等等
-
-    @classmethod
-    def new(cls, system_prompt: str) -> "Session":
-        return cls(history=[Message.system(system_prompt)])
-```
-
-`ReActAgent` 不再持有 history/计数器, 通过 property 代理到 session:
-
-```python
-class ReActAgent:
-    @property
-    def session(self) -> Session:
-        return self.registry.session
-
-    @property
-    def history(self) -> list[Message]:
-        return self.session.history
-
-    def new_session(self) -> None:
-        # reset 一行解决: 重建 Session, 所有字段默认值清零
-        self.registry.session = Session.new(self.system_prompt)
-```
-
-### 起没起效果
-
-起了, 而且**红利不止于 reset 干净**:
-
-- **写测试更顺** — 之前 audit 脚本里我会 build_default_registry 三次开三个独立 registry 来绕开 read_cache 污染. 现在新 session 一行就独立
-- **token 计数有了归宿** — 加 prompt_tokens_total/completion_tokens_total 这两个新字段时, 直接进 Session, 不需要再决定"挂在哪里". 见 [§4](#4-token-和成本可见--不再黑盒烧钱)
-- **后面所有新状态字段都进 Session** — codeblock_nag_count、estimated_turns/exact_turns 都是这次设计后顺手加的, 没纠结过"放哪"
-
-更重要的是**它没引入新复杂度**. 改完 ReActAgent.__init__ 那 7 行代码, dispatch / step / run 全部不需要动 — 因为 history 这些通过 property 代理, 用法没变.
-
-### 中间的尝试
-
-我在动手前讨论过三个方案 (具体见 commit `a156839` 之前的对话):
-
-- **方案 A**: 所有 handler 签名加 `session` 参数 — 侵入太大, 9 个工具有 8 个根本不需要 session
-- **方案 B**: dispatch 检测 handler 签名里有没有 `_session: Session`, 有就注入 — 优雅, 选了这个
-- **方案 C**: registry 持有 session 引用 — 之前以为破坏"无状态 registry", 后来发现 04 的 registry 已经持有 read_cache 状态了, 升级为 session 不算新耦合, **最后用的是这个**
-
-最终落地: registry 持有 session, dispatch 通过反射给声明了 `_session: Session` 的 handler 自动注入. 反射默认排除 `_` 前缀参数 (避免 `_session` 跑进给模型看的 schema). 工具表里只有 `tool_apply_patch` 和 `tool_todo` 用了这个机制 — 其他 8 个 handler 是纯函数, 跟 session 完全脱耦.
+整个流程**主 workspace 全程没动**, 失败也不留痕.
 
 ---
 
-## 2. 流式输出 — 看见模型在思考
+## 2. 怎么实现 — 5 个核心设计选择
 
-### 痛点
+跟用户讨论后定的 5 个选择. 每个都有真理由:
 
-04 默认非流式. 你输入 query, 看到 `→ [1] 调用模型 …` 然后屏幕静止 5-30 秒. 第一次用以为它挂了. 7B 在 4060 上的速度大约 40 token/秒, 一个稍长的回答就要等十几秒.
+### 2.1 隔离机制: git worktree, 不是 cp -r
 
-### 怎么做
+**对比**:
 
-OpenAI 兼容协议的流式很标准 — `payload["stream"] = True`, response 是 SSE (Server-Sent Events), 一行行 JSON delta. 但**陷阱比看起来多**.
+| 方案 | 速度 | 干净度 | 限制 |
+|---|---|---|---|
+| `cp -r workspace /tmp/sub` | 慢 (大项目几十秒) | 干净 | 无 |
+| `git worktree add /tmp/sub HEAD` | **秒级** | 自带 git 状态隔离 | 要求是 git repo |
+| Linux overlayfs | 快 | 干净 | Windows 没有 |
 
-我先调研了 Claude Code (CLI) 的流式行为 (因为它是同类产品, 它做对的我抄, 它做错的我避). 重点观察:
+选 git worktree. 用户的项目大概率是 git repo, 这个限制可接受. 大项目场景下 cp -r 慢得不能用.
 
-- **不是 token-by-token 输出** — Claude Code 也是 chunk-based buffering. 原因: 终端逐 token print 闪屏严重, 中文 + ANSI 颜色组合下尤其卡 (有人提过 issue #29213)
-- **tool_call 等完整 arguments 才显示** — 不做"半截 JSON 预览". 不然显示个 `{"path":"`没了, 用户也看不懂
-- **Ctrl-C 应当干净中断** — 但 Claude Code 自己的 issue (#26802, #17466) 抱怨 Ctrl-C 不可靠. 我们要做对
-
-我们的实现 (在 [todo.py 的 `_StreamRenderer`](todo.py)):
-
-1. **OllamaClient.chat_stream** 是个 generator, yield 出每个 delta
-2. **`_StreamRenderer.feed(delta)`** 累积 content / tool_calls. 文本累积到行边界 (`\n`) 或 80 字符上限再 flush
-3. **tool_call reassembly** — OpenAI 协议把 `tool_calls[i].function.arguments` 拆成多个分片, 按 `index` 累加. 但 Ollama 实际把整个 tool_call 一次性塞进单 delta, 跟 spec 不一致 (但对我们更友好, reassembly 一片或 N 片都能吃)
-4. **think 标签不在流式期分色** — Qwen 的 `<think>...</think>` 跨 chunk 边界处理太脆 (考虑 chunk 切在 `<thi` + `nk>` 中间), 流式期间整段普通色, 等 finalize 用 `split_think` 一次性剥离进 history
-5. **Ctrl-C 处理** — 流式 loop 里 try/except KeyboardInterrupt, 已收到的 partial 入 history (带 `[interrupted by user]` 标记让模型下次知道), 半截 tool_call **不执行** (避免拿不完整 arguments 调工具)
-
-### 起没起效果
-
-起了, 体验差异巨大. 但**也暴露了一个真相**: 第一轮模型生成 tool_call 时, 大部分内容是 tool_call 而不是 content, 所以"流式视觉体验"那一轮其实不明显. 真正闪光的是**第二轮 — 模型拿到工具结果后生成给用户的可见答案**, 那时候才是大段 token 流出.
-
-跑过真 Ollama 探针 (`scripts/probe_stream_v3.py`) 验证: 长回复 (~6000 字符) 拆成 1168 个 deltas, 平均每 5 字符一个 delta, 每 23ms 一次 — 真 token 级流式.
-
-### 中间的尝试
-
-写了三个版本探针 (probe_stream.py / v2 / v3, 后两个保留为 `scripts/probe_stream_v3.py`). v1 测短回复 + tool_call, v2 测中等长度, v3 强制长英文回复. 结论:
-
-- **短回复时 Ollama 会 batch dump** (1 个 delta 包全部) — 看起来像没流式, 实际是 Ollama 内部缓冲优化, 不是 bug
-- **长回复时 Ollama 真流式** — token 级 delta
-- **MiniMax 流式粒度更粗** — 平均 130 字符/delta (按句/段而不是 token), 视觉上"成段成段"出, 仍然流式
-
-### Ctrl-C 这件事我们做对了
-
-Claude Code 的 issue 26802 / 17466 抱怨 escape 不可靠. 我们的实现:
+**怎么做**:
 
 ```python
-try:
-    for delta in self.llm.chat_stream(messages, tools):
-        renderer.feed(delta)
-except KeyboardInterrupt:
-    interrupted = True
-msg = renderer.finalize()  # 先 flush partial 内容
-if interrupted:
-    print(f"(interrupted by user — partial output kept)")
+sub_dir = Path(tempfile.mkdtemp(prefix="minicode-sub-"))
+subprocess.run(["git", "worktree", "add", "--detach", str(sub_dir), "HEAD"], cwd=main_workdir)
 ```
 
-- partial content 立刻进 history, 不丢
-- 半截 tool_call (假设 arguments 流到一半) **不执行** — 这是关键安全策略. 我们宁可错失一次 tool 调用, 也不拿不确定的 arguments 去调工具
+`--detach` 让 worktree 处于 detached HEAD, 不创建分支. 我们不需要分支管理 — worktree 用完就扔.
 
-测试用 fake LLM 模拟"流到一半 raise KeyboardInterrupt", 验证: visible 内容入历史 + `[interrupted by user]` 标记 + actions 为空. 通过.
+### 2.2 同步等, 不是后台轮询
 
----
+主 agent 调 spawn_agent, 必须**等子 agent 跑完**才返回. 不用"派出去后异步轮询" 那种复杂模式.
 
-## 3. 双后端 — Ollama 和 MiniMax 之间切
-
-### 为什么要做
-
-04 一直绑死 Ollama 跑本地 7B. 跑下来发现 7B 在多步任务上**有能力上限**:
-
-实际跑过 query "解释一下 todo.py 第 800-900 行 apply_patch 的两阶段锁怎么工作的", 7B 的表现:
-
-- Turn 1: 调 `LS('/path/to/todo.py')` — 把训练数据里的占位符当真实路径
-- Turn 2: 收到 PATH_ESCAPE, 不重试, 直接说"please provide a path"
-- 改了 SYSTEM 加 workspace 后, 第二次跑:
-- Turn 1: 调对了 Read
-- Turn 2: 莫名其妙调 apply_patch 传空 patch
-- Turn 3: 拿到 PARSE_FAILED, 在 todo 里写"Review the provided unified diff" — 幻觉了一个 diff
-- Turn 4: 给用户回答"please ensure your unified diff includes proper headers" — 把自己当客服了
-
-7B 的"任务连续性"问题在 README §3.4 (04 时代) 早就记录过, 这是模型能力上限, prompt 治不好.
-
-### 想清楚再动手
-
-我先讨论了三个方向:
-
-1. **接受现状** — 把"7B 跑长解释问题不可靠"写进已知局限, 不再为这个改代码
-2. **换更大模型** — 验证是不是模型能力问题
-3. **加更狠的系统层约束** — 比如 query intent 分类禁用某些工具. 这条违背"不过度设计"原则, 否决
-
-选了 1+2: 接受 7B 的极限 + 提供云端切换.
-
-### 用 MiniMax 还是别的
-
-研究了一下 (调研报告归档在 commit `079b7d3` 的对话里). MiniMax-M2.7:
-
-- 200K context, 131K output (M2 系列)
-- 公开标称为"自主编码 agent"打造, SWE-Bench 分数高
-- 国内可访问 (`api.minimaxi.com`)
-- **OpenAI 兼容端点** — 这一条是关键, 我们的 OllamaClient 是 OpenAI 形态, 复用代码量极大
-
-也研究了它的 Anthropic 兼容端点 (`/anthropic/v1/messages`), 但 litellm #18834 等 issue 有已知 bug, 选 OpenAI 路径稳得多.
-
-### 怎么实现
-
-抽出一个共享基类:
+理由:
+- REPL 体验里"派出去 → 等" 是用户能接受的, 跟普通 tool_call 一样
+- 异步会让主 agent 的对话历史变得复杂 (穿插"任务还在跑" 的中间状态)
+- 简单的同步阻塞配上**超时兜底** (默认 5 分钟) 就够
 
 ```python
-class _OpenAICompatClient:
-    """OpenAI-兼容 HTTP 客户端基类 — Ollama 和 MiniMax 共享这套."""
-
-    def __init__(self, base_url, model, timeout, extra_headers=None):
-        self.base_url = base_url
-        self.model = model
-        self.extra_headers = extra_headers or {}
-
-    def chat(self, messages, tools): ...
-    def chat_stream(self, messages, tools): ...
-
-
-class OllamaClient(_OpenAICompatClient):
-    provider_name = "Ollama"
-    # 默认 base_url 本地, 不需要 auth header
-
-class MinimaxClient(_OpenAICompatClient):
-    provider_name = "MiniMax"
-    def __init__(self, api_key, ...):
-        super().__init__(extra_headers={"Authorization": f"Bearer {api_key}"})
+SUB_AGENT_TIMEOUT = int(os.environ.get("MINICODE_SUB_TIMEOUT", "300"))
 ```
 
-`load_model()` 工厂按 `MINICODE_BACKEND` 环境变量选:
+### 2.3 子 agent 继承主 agent 的 LLM 实例
+
+主 agent 用 MiniMax-M2.7, 子 agent 也用 MiniMax-M2.7. 复用同一个客户端连接.
+
+**为什么不允许子 agent 用不同 backend** (比如主用 MiniMax, 子用 Ollama 省钱)?
+
+- 实现复杂度高
+- 子 agent 任务质量比成本重要 — 用户想"准确知道这个改动通不通过测试", 不想为了省 5 分钱让子 agent 给个不靠谱答案
+- 想省钱可以**整体**切到 Ollama (主和子都换)
+
+具体实现: 模块级 `_SPAWN_LLM` 在 REPL 启动时设, spawn_agent 直接复用.
 
 ```python
-def load_model() -> LLMClient:
-    if BACKEND == "minimax":
-        return MinimaxClient(api_key=MINIMAX_API_KEY)
-    elif BACKEND == "ollama":
-        return OllamaClient()
-    else:
-        raise RuntimeError(f"Unknown MINICODE_BACKEND={BACKEND!r}")
+# repl() 启动时
+_SPAWN_LLM = llm
+
+# spawn_agent 内部
+sub_agent = ReActAgent(_SPAWN_LLM, sub_registry, system_prompt=sub_system)
 ```
 
-切换方法: 在项目根 `.env` 里写 `MINICODE_BACKEND=minimax`, 启动时自动读. 见 [§9](#9-怎么跑起来).
+### 2.4 子 agent 不能再派子 agent (深度限制 1)
 
-### 中间踩的坑
+`build_subagent_registry` 显式**不注册** spawn_agent 工具. 子 agent 工具集 = 主 agent 工具集 - {spawn_agent, todo}.
 
-跑探针验证 MiniMax 端点时碰到 **HTTP 404**. 直接 curl 同样 payload 是 200. 排查后发现:
+**为什么深度限制 1**:
+- 7B 模型容易递归爆炸 — 派一个子 agent 派一个孙 agent 派一个曾孙 agent ...
+- 深度 > 1 的复杂度对应的实用场景几乎没有
+- 简单粗暴 = 安全
 
-```python
-final stream URL: https://api.minimaxi.com/v1/v1/chat/completions
-                                          ^^^^^^^^
-                                          /v1 重复了
-```
+也去掉 `todo` 工具 — 子 agent 是单一目标的, 不需要规划.
 
-`base_url = "https://api.minimaxi.com/v1"` (来自 .env.example 默认值), 然后 chat_stream 里又拼 `/v1/chat/completions`. 修法: 跟 Ollama 一样, base_url 只到主机名 `https://api.minimaxi.com`, client 内部统一拼 `/v1/chat/completions`. 在 .env.example 里加了显式注释 "do NOT include /v1 in base_url" 防止下次再犯. (commit `d91f227`)
+### 2.5 失败 worktree 保留, 成功 worktree 清掉
 
-### 起没起效果
-
-跑同一个 query (解释 apply_patch 锁) 对比:
-
-| | 7B (Ollama) | M2.7 (MiniMax) |
-|---|---|---|
-| Turn 1 | LS 错误路径 | Read 正确 offset/limit |
-| Turn 2 | 调 apply_patch 传空 patch | Grep 找 def tool_apply_patch 真实位置 |
-| Turn 3 | todo 摆烂 + 让用户给 patch | Read 1050-1250 行 |
-| Turn 4 | 教用户怎么写 diff 格式 | 流式生成完整结构化解释 |
-| 结果 | 没回答原问题 | 完整回答, 含三阶段拆解 + 表格 + 总结 |
-
-M2.7 还**自我纠错** — Turn 2 它说"读到的 lines 800-900 是 grep 工具, apply_patch 不在这个范围", 主动 Grep 找真实位置. 这种"我读错了, 再来"的元认知能力, 7B 完全做不到.
-
----
-
-## 4. Token 和成本可见 — 不再黑盒烧钱
-
-### 为什么要做
-
-切到 MiniMax 后第一次跑, 跑完一脸懵 — 烧了多少钱? 不知道. 跑第二次还是不知道. 长任务跑下来更没数. 云端按 token 计费, 不能黑盒.
-
-### 怎么做
-
-**取数据**: OpenAI 协议规定流式的 usage 在最后一个 chunk 顶层 (不在 delta 里), 但需要在请求里加 `stream_options: {include_usage: true}`. Ollama 不识别这个字段直接忽略 (无害), MiniMax 会照办.
-
-```python
-payload = {
-    "model": self.model,
-    "messages": messages,
-    "stream": True,
-    "stream_options": {"include_usage": True},  # 关键
-}
-```
-
-`chat_stream` 解析 chunk 时除了取 delta, 也看顶层有没有 `usage`:
-
-```python
-if isinstance(chunk.get("usage"), dict):
-    self.last_usage = chunk["usage"]  # 留给调用方取
-```
-
-**优雅降级**: 如果后端没给 usage (Ollama 流式不给), 用字符数估算 (中英混合大致 1 token ≈ 3 字符), 标 `(estimated)` 让用户知道是估的.
-
-**累加到 Session**: 上面 §1 已经有 Session 了, 加 `prompt_tokens_total` / `completion_tokens_total` 字段, 每个 turn 累加, run() 退出时显示总计.
-
-**显示成本**: MiniMax-M2.7 当前定价大约 input ¥1/M, output ¥8/M. 我们用保守值 (¥2/M, ¥8/M). 价格放在模块顶常量, 改一处即可:
-
-```python
-MINIMAX_PRICE_INPUT_PER_M = float(os.environ.get("MINIMAX_PRICE_IN", "2.0"))
-MINIMAX_PRICE_OUTPUT_PER_M = float(os.environ.get("MINIMAX_PRICE_OUT", "8.0"))
-```
-
-### 长什么样
-
-每个 turn 末尾一行:
-
-```
-→ [2] tokens: 2.1K in + 819 out = 2.9K  ≈ ¥0.0107
-```
-
-DONE / GAVE UP / MAX ROUNDS 时给总计:
-
-```
-┌─ ✅ DONE ════════════════════════════════════════════════
-│ session total: 5.3K in + 2.1K out = 7.4K  ≈ ¥0.0274
-└═══════════════════════════════════════════════════════════
-```
-
-如果是 Ollama (本地零成本), 不显示 `≈ ¥` 部分; 如果是估算, 标 `(estimated)`.
-
-### 中间的尝试
-
-最初想"非流式调一次额外的请求取 usage"——浪费一次 API call. 否决.
-
-也想过"加 tiktoken 算精确 token"——破坏"零依赖"卖点, 而且 tiktoken 也算不准 MiniMax 的 token. 否决.
-
-最后选了"include_usage 优先, 估算兜底"的方案 — 不引依赖, 后端给真值就用真值, 没有就估算并标注. 实测 MiniMax 给的是真值, Ollama 流式给不出但没关系 (本地零成本无所谓).
-
----
-
-## 5. 代码块伪 tool_call — 系统层把 prompt 兜不住的接住
-
-### 04 已经踩过的坑
-
-04 README §3.2 记录过: 7B 经常不走 `tool_calls` 字段, 而是在 content 里写 ```json 块假装调工具. 系统收不到工具调用, 任务卡死. 04 在 SYSTEM 里加了 CRITICAL 段堵 ```json 和 ```diff/```patch.
-
-但 05 实际跑发现: **堵了 ```json/```diff, 模型改用 ```bash 或 ```shell**. 你压一处, 它从另一处冒出来.
-
-### 两层防线
-
-**Prompt 层** (软约束) — SYSTEM 里把 ```bash/```sh/```shell 也加进禁令, 并且讲清楚 RUN vs SHOW 的区别 (怕误伤"展示代码"的合法用法):
-
-```
-TOOL-CALL PROTOCOL (critical): when invoking a tool, emit a real
-structured tool_call. NEVER write the call as visible text — not as
-```json, ```diff, ```patch, ```bash, ```sh, or any other code block
-containing what should have been a tool argument. ...
-```
-
-**系统层** (硬约束) — 不指望 prompt 全靠. 在 `run()` 主循环加检测:
-
-```python
-_DODGED_TOOL_BLOCK_RE = re.compile(
-    r"```(?:bash|sh|shell|diff|patch|json)\b",
-    re.IGNORECASE,
-)
-
-def looks_like_dodged_tool_call(text: str) -> bool:
-    """模型在 visible 里写了 ```bash/```diff 等代码块 — 大概率是想绕过 tool_calls."""
-    return bool(_DODGED_TOOL_BLOCK_RE.search(text))
-```
-
-如果一轮没 tool_call 但 visible 里命中这个正则, **不立刻 DONE**, 而是注入一条 reminder user message 重来:
-
-```python
-if not res.actions:
-    if looks_like_dodged_tool_call(res.visible):
-        sess.codeblock_nag_count += 1
-        if sess.codeblock_nag_count > self.CODEBLOCK_NAG_LIMIT:  # 默认 2
-            _box(f"⛔ GAVE UP", ...); return
-        _box(f"⚠️  CODEBLOCK NAG ({sess.codeblock_nag_count}/2)", ...)
-        self.history.append(Message.user(_CODEBLOCK_REMINDER))
-        continue
-```
-
-### 为什么禁这 6 个语言不禁别的
-
-`bash / sh / shell / diff / patch / json` 这 6 个在 agent 场景下**几乎只在"绕过 tool_calls"时出现**. 用户不会问"教我写 diff" 或 "解释下这个 json schema". 误伤率极低.
-
-`python / js / go / c++ / sql` 这些在"展示代码示例"场景里高频合法 (回答"教我写一段 Python"必然会用 ```python). 不在触发列表里, 防止误伤.
-
-### 第一次实现踩的坑
-
-最初我写的版本: **任何 tool_call 都重置 codeblock_nag_count**. 结果跑出灾难性振荡:
-
-- Turn 1: dodge ```bash → NAG 1/2
-- Turn 2: 模型调 todo (摆烂凑数, 不解决任何问题) → counter 重置为 0
-- Turn 3: dodge ```bash → NAG 1/2 (又是 1/2!)
-- Turn 4: 摆烂 todo → 重置
-- ... 死循环到第 19 轮 MAX ROUNDS 才退出
-
-原因: 一次合法 tool_call 不应"洗白"前面的嘴硬, 否则模型用 todo 摆烂就能永远绕过. 修了之后 (commit `580e9bb`):
-
-- counter 在一次 `run()` 内**只增不减**
-- 只在每个 `run()` **入口归零** (上个任务的累计不该惩罚下个任务)
-
-实测后振荡场景在第 5 轮触发 GAVE UP, 不再 19 轮死循环.
-
----
-
-## 6. PATH_ESCAPE 错误信息 — 不让模型在错误后放弃
-
-### 现象
-
-7B 模型有个倾向: 工具返回错误后, 把它当**任务终止信号**. 比如:
-
-- 调 LS('/path/to/todo.py') → PATH_ESCAPE
-- 不重试, 直接对用户说"please provide a path"
-
-**模型把 PATH_ESCAPE 解读成了"用户给的路径错"而不是"我自己用错了"**.
-
-### 修法
-
-错误消息本身是引导. 改 `_safe_path` 抛的 ValueError 文案:
-
-```python
-raise ValueError(
-    f"Path '{p}' is outside the workspace ({workdir}). "
-    f"Use a path RELATIVE to the workspace — e.g. 'todo.py', "
-    f"'src/foo.py', or '.' for the workspace root. "
-    f"If you don't know what's there, call LS with no arguments first."
-)
-```
-
-四个动作:
-1. 说出 workspace 在哪
-2. 说"用相对路径"
-3. 给三个具体例子
-4. 给恢复路径 (call LS 看看)
-
-加上 SYSTEM 顶部已经有 WORKSPACE 段说明工作目录, 模型有两次接触到正确做法的机会 (启动时一次 + 出错时一次).
-
-### 中间的尝试
-
-讨论过加第三层"SYSTEM 加错误后必须重试的强制约束". 否决, 理由: SYSTEM 已经够长了, 加新的禁令时会摊薄前面已有的. **错误消息引导是最直接的兜底, 不引入新 prompt 噪音**.
-
-### 起没起效果
-
-7B 的失败模式不再是"放弃", 改成"乱试别的工具" (后来又催生了 §5 的 dodge 检测). 错误消息对 M2.7 几乎无影响 (它本来就会重试).
-
----
-
-## 7. 流式 Read 和 SYSTEM 精简 — 两个事后优化
-
-这俩不是"新功能", 是 v5 大改完成后扫一遍代码做的清洁工作. 但都修了真问题, 不是为改而改.
-
-### 优化 G: 流式 Read
-
-**问题**: `tool_read` 把整个文件读进内存:
-
-```python
-all_lines = p.read_text(...).splitlines()  # 全文加载
-selected = all_lines[start:end]              # 然后切片
-```
-
-对 50MB 日志文件 + `Read(limit=100, offset=0)`, 仍然全文加载. Ollama 时代不显眼 (本地内存便宜), 接 MiniMax 后**输入 token 变贵** — 真不能浪费.
-
-**修法**: 流式读到 `start + limit` 行就**停止 append**, 但**继续读到 EOF 计数行数** (拿到精确 total_lines):
-
-```python
-with p.open("r", encoding="utf-8", errors="replace") as f:
-    for i, raw in enumerate(f):
-        total += 1
-        line = raw.rstrip("\r\n")  # 跨平台行尾
-        if i < start:
-            continue
-        if limit is not None and len(selected) >= limit:
-            continue  # 窗口满了不存, 但继续数 total
-        selected.append(line)
-```
-
-50MB 文件 + Read(limit=100) 现在只占 100 行内存, 不是 50MB. total_lines 仍精确 (模型需要它来选下次 offset).
-
-跨平台行尾问题: Windows 的 `\r\n` 用 `rstrip("\n")` 会留 `\r`. 改 `rstrip("\r\n")`. (这是 04 splitlines() 隐式处理的, 流式版本得显式).
-
-### 优化 H: SYSTEM 精简
-
-**问题**: SYSTEM 累积到 3635 字符 ≈ 1200 token. 每次 LLM 调用都重复传, MiniMax 输入端按 ¥2/M 算, 每 turn 烧 ¥0.0024 在 SYSTEM 上.
-
-**怎么压**:
-
-- 多句陈述句改成单句祈使句 ("READ BEFORE WRITE: edit_file / apply_patch / ... requires a prior Read on it.")
-- 删掉"超过 200 行分块写"的段落 — 那是给 7B 写的, 对 M2.7 (输出预算大得多) 没用. 而且系统层有 chunked write 兜底, prompt 没必要再讲
-- (a)/(b)/(c)/(d) 四点禁令压成一行列出语言. 真正起约束作用的是系统层 detection, 不是 SYSTEM 文字
-
-**结果**: 3635 → 1739 字符, **砍 52%**, 每 turn 省 ~632 token. 5 turn 任务省 ¥0.006, 100 个任务/天省 ¥0.6.
-
-更重要的是 SYSTEM 现在**可读**了 — 下次再加新约束时, 不会因为它已经 3635 字符就不敢动.
-
-audit 验证关键短语没丢: WORKSPACE / PATH_ESCAPE / READ BEFORE WRITE / CONFLICT / apply_patch / todo / in_progress / TOOL-CALL PROTOCOL / ```bash / ```diff / RUN — 都在.
-
----
-
-## 8. 安全脚手架 — .env 和 pre-commit hook
-
-接了 MiniMax 就要管密钥. 几个原则:
-
-### .env 模式
-
-- 所有密钥从 `os.environ.get(...)` 读, 不出现在源码里
-- `.env` 在 `.gitignore` 里, 永远不会 commit
-- `.env.example` 进 git, 给协作者看格式 (占位符, 没真值)
-- 写了一个 50 行的 `_load_dotenv()` (零依赖, 启动时自动读), 不引 `python-dotenv`
-
-```python
-def _load_dotenv(path: Path) -> None:
-    """读 .env 文件, 把 KEY=value 填进 os.environ — 但不覆盖已存在的环境变量."""
-    if not path.is_file():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        ...
-        if key and key not in os.environ:
-            os.environ[key] = value
-```
-
-设计选择: 已存在的环境变量优先 — shell 里 `set MINICODE_BACKEND=ollama` 能临时覆盖 .env 里的设置.
-
-### pre-commit hook
-
-`.git/hooks/pre-commit` 是个 bash 脚本, 扫 staged diff 里有没有常见密钥前缀:
+子 agent 报告 `FAIL` / `ERROR` / `GAVE UP` 时, **不**自动清 worktree. 把路径放进 `result.data["worktree"]` 让用户能去看:
 
 ```bash
-PATTERN='(sk-api-|sk-ant-|sk-or-|sk-proj-|sk-svcacct-|AIza[0-9A-Za-z_-]{20,}|ghp_[0-9A-Za-z]{20,}|gho_[0-9A-Za-z]{20,}|xox[bp]-)'
+cd /tmp/minicode-sub-XXX
+ls -la  # 看子 agent 留下了什么状态
 ```
 
-发现就拒绝 commit, 给修法指引. 测试用 fake `sk-api-FAKE...` 验证过, 正确挡住.
+成功时清掉 (`git worktree remove --force` + `rmtree`).
 
-注意: hook 在 `.git/hooks/` 里, 是**每个 clone 独立**的. 别人 clone 你的仓库不会自动得到 — 这是 git 的设计 (出于安全考虑, hook 不进 repo). 如果想分发, 要么用 `husky` 类工具 (引依赖), 要么写个 `install_hooks.sh` 让用户主动跑. 我们目前接受 per-clone, 因为这是单人项目.
-
-### 这事的背景
-
-老实说, 这套防线是**从一次错误中学到的**: 我跑了 v5 接 MiniMax 那次, 用户在对话里**贴了真实密钥**两次. 我没办法把已经发出的对话撤回, 但可以保证未来不再发生 — `.env` + pre-commit hook + 代码永远从 env 读, 三层兜底.
+判断关键词: 子 agent 最后一条 assistant 消息含 "FAIL" / "ERROR" / "GAVE UP" → 失败. 否则成功.
 
 ---
 
-## 9. 怎么跑起来
+## 3. 工作流走一遍 — 实测真录
 
-### 默认 Ollama (本地, 零成本)
+实测对话 (M2.7 backend). 用户输入是中文 "试一下", 触发了 spawn_agent. 输出我精简了一下:
 
-需要先装 Ollama 桌面版 (`https://ollama.com/`), 拉默认模型:
+**用户**:
+```
+试一下把 todo.py 第 1 行改成 hhhhhhhh, 跑 pytest 看通不通过
+```
+
+**主 agent (Turn 1)**: 直接派子 agent
+
+```
+spawn_agent(task="In todo.py, replace line 1 with 'hhhhhhhh' (use edit_file),
+             then run pytest and report PASS/FAIL with the failing test names if any.")
+```
+
+**子 agent (在 /tmp/minicode-sub-0jzgy0ag 里, M2.7 跑了 4 轮)**:
+
+```
+Turn 1: Read(path='todo.py')
+        → 看到第 1 行是 docstring 开头 """MiniCode Agent v6 — ..."""
+
+Turn 2: edit_file(path='todo.py', old_text='"""MiniCode Agent v6 — ...',
+                  new_text='hhhhhhhh')
+        → 改成功
+
+Turn 3: bash(command='pytest 2>&1 | head -100')
+        → 跑 pytest, 收集失败 (SyntaxError on line 5)
+
+Turn 4: 报告 "FAIL — syntax error in todo.py"
+```
+
+**主 agent (Turn 2)**: 拿到子 agent 结果
+
+```
+sub-agent finished. FAIL — syntax error in todo.py.
+diff: 2 line(s) changed across 1 file(s).
+
+Full diff (use this verbatim if user wants to apply):
+diff --git a/todo.py b/todo.py
+@@ -1,4 +1,4 @@
+-"""MiniCode Agent v6 — sub-agents for "explore-without-pollution" workflow.
++hhhhhhhh
+ ...
+```
+
+**主 agent 的回复给用户**:
+
+> 结果: **FAIL** ❌
+>
+> 修改后 todo.py 出现 **SyntaxError** — 把多行文档字符串的开头 `"""` 替换成 `hhhhhhhh` 后, Python 把后面的文本当成了普通代码, 导致第 5 行的 em dash `—` 变成了无效字符.
+>
+> 修改内容:
+> ```
+> -"""MiniCode Agent v6 — sub-agents for "explore-without-pollution" workflow.
+> +hhhhhhhh
+> ```
+>
+> 要我把这份修改应用到主工作区吗?
+
+**用户**: "不要"
+
+**结果**: 主 workspace 的 todo.py **没动过**. worktree 自动清理 (因为子 agent 报告 FAIL → 应该保留, 但 token 在第二次 实测中被路径含 FAIL 关键字检测到, worktree 保留了 — 你能 `cd /tmp/minicode-sub-0jzgy0ag` 去看子 agent 留下的状态).
+
+**关键观察点**:
+- 主 agent **不自动 apply**, 只是报告 + 询问. 这是 spawn_agent 设计的核心 — 决策权在用户/主 agent
+- 主 agent 看到的 diff 是 **真 diff** (字符级一致, 不是模型 hallucinate 的)
+- 子 agent 跑期间没触发 todo NAG (虽然它跑了 4 轮没调 todo, 但**子 session is_subagent=True**, NAG 跳过)
+- 整个 spawn_agent 走完用了**约 0.044 元** (MiniMax 真 backend 计费)
+
+---
+
+## 4. 修复迭代 — 5 次实测发现的真问题
+
+spawn_agent 的实现**第一版能跑通**单元测试, 但**真实跑出来一堆问题**, 每个都是新的发现. 5 次实测对应 5 个 commit:
+
+### 4.1 实测 1: 模型完全不用 spawn_agent
+
+**第一版**: 在 `build_default_registry` 注册了 spawn_agent 工具, SYSTEM 里加了一段说明. 跑实测, M2.7 看到"试一下"**直接 edit_file 主 workspace** + bash pytest, 完全无视 spawn_agent. 主 workspace 的 todo.py 真被改成 hhhhhhhh 了几秒, 然后 agent 自己又 edit_file 改回去.
+
+**根因**: 工具存在 ≠ 模型会用. SYSTEM 里的引导太弱, M2.7 没接到"应当用 spawn_agent" 的强信号.
+
+**修法 (commit `481ab1a`)**:
+
+1. SYSTEM 加 MANDATORY 段, 明确触发词:
+   ```
+   SUB-AGENT (spawn_agent) — MANDATORY for exploratory changes:
+   Trigger words: "试一下", "试试", "试着", "try", "see if", "experiment", ...
+   ```
+2. 加 few-shot 例子 (正反两个):
+   - 正例: 用户说"试一下" → 应该 spawn_agent
+   - 反例: 用户说"把 X 改成 Y" (没"试") → 直接 edit_file
+3. spawn_agent 的工具 description 从被动说明改成主动推销:
+   ```
+   *** USE THIS for ANY 'try / 试一下 / 试试' request from the user. ***
+   This is the ONLY safe way to apply experimental changes.
+   ```
+
+**效果**: 实测 2 跑同一个 query, M2.7 立刻派 spawn_agent.
+
+**教训**: prompt 是软约束, 但写法决定听不听. 软约束 + few-shot + 工具 description 主动推销 = 强信号.
+
+### 4.2 实测 2: 5 个连锁问题
+
+第一个修生效了, M2.7 用 spawn_agent 了. 但**新问题暴露**:
+
+1. 主 agent 给用户报告 diff 时**完全是编的** ("class TodoList: ..." 那种 — 真 diff 里完全没有这个类)
+2. 子 agent 跑时触发了主 agent 的 todo NAG
+3. 子 agent 用 ` cd "C:\Users\..." && pytest ` 多此一举 cd 到 worktree (它已经在 worktree 里了)
+4. spawn_agent 调 git init 时把 .env (含密钥) commit 进了根 commit
+5. 主 agent 显示 diff 时用 ```diff 块, 触发 codeblock NAG
+
+**根因 (1)**: spawn_agent 的 ToolResult.data 含真 diff, 但 data 不喂模型 (这是 05 设计 — text 给模型, data 给程序). 模型只看到 text 里的 "diff: 2 line(s) changed", 看不到内容, 报告时只能编.
+
+**根因 (2)**: 子 agent 跑时计数器照常 +1, 触达 3 → NAG 注入. 但子 agent 没 todo 工具, NAG 是噪音.
+
+**根因 (3)**: 子 agent 的 SYSTEM 没说"你的 cwd 已经在 worktree 里了".
+
+**根因 (4)**: WORKTREE_FAILED 错误消息太短 ("missing .git, run git init"), 模型按字面照做, git add 把 .env 也加了.
+
+**根因 (5)**: 主 agent 的 SYSTEM 没说"显示 diff 给用户时不要用 ```diff 块".
+
+**修法 (commit `3a97423`)**:
+
+1. spawn_agent 的 ToolResult.text 加上**真 diff 内容** (截断到 4000 字符, 全文仍在 data["diff"]):
+   ```python
+   text_parts.append(f"\nFull diff (use this verbatim if user wants to apply):\n{diff_preview}")
+   ```
+2. Session 加字段 `is_subagent: bool = False`. spawn_agent 创建子 session 时设 True. ReActAgent.run() 检查 NAG 时跳过子 session
+3. 子 agent SYSTEM 加: "YOU ARE ALREADY AT THE WORKTREE — your cwd is exactly the workspace above. Do NOT cd."
+4. WORKTREE_FAILED 错误消息升级为多行引导, 包含 .gitignore heredoc + 警告 .env 风险
+5. 主 agent SYSTEM 加: "When showing diffs to the user, DO NOT wrap in ```diff or ```patch — that triggers the codeblock-dodge detector."
+
+**效果**: 实测 3 跑通, 主 agent 报告的 diff 准确, 没 NAG 噪音. 但**子 agent 的 cd 警告没生效**(模型仍 cd), `主 agent` 仍可能用 ```diff (但这次是无 lang 的 ```, 没触发 NAG, 算擦边过).
+
+**教训**: 一次实测往往暴露 N 个问题, 修起来要分清"prompt 能解决的" 和 "需要系统层兜底的".
+
+### 4.3 实测 3: spawn_agent 拿到的 diff 有 2/3 是 .pyc 噪音
+
+实测 3 跑出 spawn_agent **结果对了** (M2.7 派对了, 子 agent 跑对了, 主 agent 报告对了). 但**返回的 diff** 是这样:
+
+```diff
+diff --git a/tests/__pycache__/conftest.cpython-312-pytest-7.4.4.pyc ...
+Binary files differ
+diff --git a/tests/__pycache__/test_tools.cpython-312-pytest-7.4.4.pyc ...
+Binary files differ
+diff --git a/todo.py ...
+@@ -1,4 +1,4 @@
+-"""MiniCode Agent v6 — ...
++hhhhhhhh
+```
+
+3 个 hunk: 2 个是 `.pyc` 改动 (子 agent 跑 pytest 时 Python 写的字节码缓存), 1 个是真 diff. **真 diff 被噪音稀释**, 而且 text 截断后用户主要看到 .pyc.
+
+**根因**: 我们 `_git_worktree_diff` 用 `git add -N .` 把 untracked 文件都标 intent-to-add 让它们出现在 diff. 但 `add -N` **绕过 .gitignore**, .pyc 也被加进去了.
+
+**修法 (commit `5e52340`, 第一次尝试)**:
+
+1. 不用 `git add -N .`, 改用 `git ls-files --others --exclude-standard` 拿"untracked 但 NOT ignored" 列表, 再逐个 `add -N --` 它们
+2. 在 worktree 根写一个 `.gitignore` 文件, 含 `__pycache__/` / `*.pyc` / `.env` 等模式
+3. WORKTREE_FAILED 错误消息也升级 — 模板 .gitignore 含同样的 patterns
+
+**实测发现**: `.git/info/exclude` 不被 git 尊重 (worktree 的 gitdir/info/ 不在 git 的 read 路径里). 必须用 worktree 根的 `.gitignore`.
+
+**效果**: .pyc 不再进 diff. 但**新问题**: 我们写的 .gitignore 文件**自己**进了 diff (因为 .gitignore 是 tracked 的, 写它就是改它).
+
+### 4.4 实测 4: spawn_agent 自己造的 .gitignore 修改进了 diff
+
+实测 4 跑完, diff 长这样:
+
+```diff
+diff --git a/.gitignore b/.gitignore
+@@ -11,3 +11,19 @@ node_modules/
++# minicode spawn_agent: ignore build/cache/secrets in diff
++__pycache__/
++...
+diff --git a/todo.py
+@@ -1,4 +1,4 @@
+-"""MiniCode Agent v6 — ...
++hhhhhhhh
+```
+
+两个 hunk: `.gitignore` 加了 16 行 (我们 spawn_agent 自己写的!) + todo.py 真改动. 用户看 diff 看到一坨 .gitignore 变更, 跟任务无关.
+
+**根因**: 任何我们在 worktree 里写的文件都是改动, 都进 diff. 不能"为了不污染 diff" 而**修改 worktree 文件**.
+
+**修法 (commit `abf0113`, 真正的 fix)**:
+
+完全不动 worktree 的 .gitignore. 改用 **git pathspec exclude** — 在 git 命令里直接传:
+
+```python
+def _build_pathspec_excludes() -> list[str]:
+    specs = []
+    for p in _WORKTREE_EXCLUDE_PATTERNS:
+        if p.endswith("/"):
+            specs.append(f":(exclude,glob)**/{p.rstrip('/')}/**")
+        else:
+            specs.append(f":(exclude,glob)**/{p}")
+    return specs
+
+# ls-files 加 pathspec
+git ls-files --others --exclude-standard -- :(exclude,glob)**/__pycache__/** :(exclude,glob)**/*.pyc ...
+
+# git diff 也加 pathspec
+git diff HEAD -- :(exclude,glob)**/__pycache__/** ...
+```
+
+这样**不动磁盘任何文件**, exclude 完全在调用层控制.
+
+**额外好处**: pathspec 也过滤 *tracked* 文件的修改 (老方案的 .gitignore 只管 untracked).
+
+**效果**: 实测 5 跑出来 diff 干净如初 — **240 字符, 1 个 hunk, 仅 todo.py 4 行**. 无 .pyc / 无 .gitignore 段. 这是 spawn_agent 本应有的样子.
+
+**教训**: 工具不应该为了自己工作而修改用户/worktree 的状态. "在 worktree 里写文件让自己工作" 听起来 OK, 实际是给 diff 引入虚假改动.
+
+### 4.5 实测 5 (最终): 完全闭环
+
+```
+diff: str[240 chars]   ← 之前是 842, 含 600+ 字符噪音
+worktree: null          ← 任务成功, 自动清掉
+sub_history_len: 9
+sub_tokens: [14310, 363]
+```
+
+主 agent 报告:
+
+> 结果: FAIL ❌
+> 修改后 todo.py 出现 SyntaxError ...
+> 修改内容: -"""MiniCode... +hhhhhhhh
+> 要我把这份修改应用到主工作区吗?
+
+完整工作流闭环. 主 workspace 全程没动. 0.044 元.
+
+---
+
+## 5. 跑起来长什么样
+
+启动:
+
+```sh
+python todo.py
+```
+
+跟 05 一样的 banner, 多了 `spawn_agent` 在工具列表里:
+
+```
+tools  : LS, Glob, Grep, Read, write_file, append_file, edit_file,
+         apply_patch, todo, spawn_agent, bash
+```
+
+输入"试一下"或"try" 类的 query → spawn_agent 触发.
+
+输入"改 X" 类直接命令 → 直接 edit_file 主 workspace, 不派子 agent.
+
+启动 spawn_agent 时会显示一个 banner:
+
+```
+┌─ 🚀 spawn_agent 启动 ───────────────────────────────────────────────────
+│ task     : <子 agent 的任务描述>
+│ worktree : C:\Users\.../AppData\Local\Temp\minicode-sub-XXX
+└───────────────────────────────────────────────────────────────────────
+```
+
+子 agent 跑期间显示子 agent 的完整 turn (Read / edit_file / bash / ...). 跑完, 主 agent 拿到结果继续.
+
+---
+
+## 6. spawn_agent 的工具层细节
+
+### 6.1 工具签名
+
+```python
+def tool_spawn_agent(task: str, _session: Session) -> ToolResult:
+    """派子 agent 在隔离 git worktree 里跑探索式任务."""
+```
+
+`_session` 由 dispatch 注入 (反射机制, 见 [05 README §1](../05-session-and-streaming/README.md#1-session--把散落的状态收回来)). 用来累加 token 到主 session.
+
+`task` 是主 agent 给子 agent 的任务描述 — 应当**同时包含改动 + 验证步骤**:
+
+> "In todo.py replace line 1 with 'X', then run pytest and report PASS/FAIL"
+
+### 6.2 返回值结构
+
+```python
+ToolResult.success(
+    text="""
+    sub-agent finished. <子 agent 最后一条 assistant 消息的摘要>
+    diff: N line(s) changed across M file(s).
+
+    Full diff (use this verbatim if user wants to apply):
+    <unified diff, 截断到 4000 字符>
+
+    [worktree retained for inspection: <path>]    ← 仅失败时
+    sub-agent tokens: X in + Y out
+    """,
+    diff="<full unified diff>",                   # 完整 diff (data, 不喂模型)
+    worktree="<path or null>",                    # 失败时保留, 成功 None
+    sub_history_len=N,                            # 子 agent 跑了几条消息
+    sub_tokens=(prompt_t, completion_t),          # 子 agent 烧的 token
+)
+```
+
+**关键**: `text` 里有 diff (供模型看), `data["diff"]` 有完整 diff (供主 agent 直接 `apply_patch(patch=data["diff"])` 用).
+
+### 6.3 错误返回
+
+| 错误码 | 触发 | 含义 |
+|---|---|---|
+| `SPAWN_NOT_AVAILABLE` | `_SPAWN_LLM` 未设 | 通常是测试场景 / 非 REPL 入口. 实际 REPL 启动会自动设 |
+| `WORKTREE_FAILED` | 主 workspace 不是 git repo / git worktree add 失败 | 错误消息含完整 git init + .gitignore + commit 引导, 警告 .env 风险 |
+
+### 6.4 子 agent 工具集
+
+`build_subagent_registry` 注册的工具 = 主 agent 工具集 - {`spawn_agent`, `todo`}:
+
+| 子 agent 有 | 子 agent 没有 |
+|---|---|
+| LS, Glob, Grep, Read | spawn_agent (防递归) |
+| write_file, append_file, edit_file | todo (单一目标, 不需规划) |
+| apply_patch, bash | |
+
+### 6.5 子 agent 的 SYSTEM (跟主 agent 完全不同)
+
+```
+You are a sub-agent spawned by the main agent to explore one specific change.
+
+ISOLATED WORKSPACE: <worktree path>
+This is a git worktree of the main project. Any change you make stays here.
+You CANNOT break the user's actual code.
+
+YOUR TASK IS BOUNDED. Do exactly what the parent asked, then stop.
+- You do NOT have a `todo` tool — single goal, no planning needed.
+- You do NOT have a `spawn_agent` tool — no recursion.
+
+YOU ARE ALREADY AT THE WORKTREE — your cwd is exactly the workspace above.
+Do NOT `cd` into it from bash.
+
+OUTPUT: keep your final reply terse — it becomes a tool_result for the parent.
+State the outcome in one or two sentences:
+  - "PASS — N/M tests passed"
+  - "FAIL — test_xyz failed: <reason>"
+  - "DONE — changes made, no test run"
+```
+
+### 6.6 _SPAWN_LLM 的设置
+
+模块级全局变量, 在 `repl()` 启动时设:
+
+```python
+def repl():
+    llm = load_model()
+    global _SPAWN_LLM
+    _SPAWN_LLM = llm   # 子 agent 复用主 agent 的 llm 实例
+    ...
+```
+
+这是个**有意的全局**, 替代方案是给 spawn_agent 通过依赖注入传 llm. 但那会让工具 handler 签名复杂化, 且 LLM 在整个进程里就一个实例, 全局是合理的.
+
+### 6.7 worktree 局部排除 — 用 pathspec, 不动磁盘
+
+最初尝试在 worktree 写 .gitignore (实测 3 → 4 演化, 见 §4.3-4.4). 最终方案用 git pathspec:
+
+```python
+_WORKTREE_EXCLUDE_PATTERNS = [
+    "__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
+    "*.pyc", "*.pyo", "*.pyd", ".DS_Store",
+    "node_modules/", ".venv/", "venv/",
+    ".env", ".env.local",   # 双保险防密钥
+]
+
+# 用法 (在 _git_worktree_diff 里):
+excludes = _build_pathspec_excludes()
+subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "--"] + excludes, ...)
+subprocess.run(["git", "diff", "HEAD", "--"] + excludes, ...)
+```
+
+每个 pattern 转成 `:(exclude,glob)**/<pattern>` 的 git pathspec. ls-files 和 git diff 都加, 这样**新文件和已 tracked 文件**都过滤.
+
+**好处**: spawn_agent 不动 worktree 任何文件. diff 完全干净.
+
+---
+
+## 7. 怎么跑
+
+### 7.1 默认 Ollama (本地, 零成本)
+
+跟 05 一样:
 
 ```bash
 ollama pull qwen2.5-coder:7b-instruct-q4_K_M
-```
 
-然后:
-
-```bash
-cd 05-session-and-streaming/
+cd 06-sub-agents
 python todo.py
 ```
 
-启动 banner 显示 `backend: Ollama @ http://localhost:11434`.
+**警告**: 7B 在 spawn_agent 上的可靠性远不如 M2.7. 它可能:
+- 不识别"试一下" 触发词, 直接 edit 主 workspace
+- 派 spawn_agent 但任务描述模糊, 子 agent 跑不出来
+- 子 agent 卡在某一步, 反复重试
 
-### 切到 MiniMax (云端, 任务连续性好)
+7B 上这个特性**有 demo 价值, 没实用价值**. 想真用 → 切 MiniMax.
+
+### 7.2 MiniMax-M2.7 (云端, spawn_agent 推荐)
 
 ```bash
-# 1. 复制 .env 模板:
+cd 06-sub-agents
 cp .env.example .env
-
-# 2. 编辑 .env, 填:
-#    MINICODE_BACKEND=minimax
-#    MINIMAX_API_KEY=<你的 key, 从 https://platform.minimaxi.com/ 拿>
-
-# 3. (可选) 跑探针验证端点能用:
-python scripts/probe_minimax.py
-
-# 4. 跑:
+# 编辑 .env: MINICODE_BACKEND=minimax + MINIMAX_API_KEY=<你的 key>
 python todo.py
 ```
 
-启动 banner 显示 `backend: MiniMax @ https://api.minimaxi.com`.
+`.env` gitignored, pre-commit hook 防泄露 (见 [05 README §8](../05-session-and-streaming/README.md#8-安全脚手架--env-和-pre-commit-hook)).
 
-`.env` 在 `.gitignore` 里, **永远不会被 commit**. pre-commit hook 也会扫密钥前缀挡住误操作.
+### 7.3 主 workspace 必须是 git repo
 
-切回 Ollama: 改 `.env` 的 `MINICODE_BACKEND=ollama` (或干脆删那行 — 默认就是 ollama).
-
-### 环境变量一览
+spawn_agent 要求**当前 cwd 是 git repo (有 .git 且有至少一个 commit)**. 没有的话第一次调 spawn_agent 会拿到 `WORKTREE_FAILED`, 错误消息含完整 init 步骤:
 
 ```
-MINICODE_BACKEND=ollama|minimax    # 选后端, 默认 ollama
-MINICODE_STREAM=1                  # 流式开关, 默认开 (设 0 强制非流式)
-MINICODE_TIMEOUT=300               # HTTP 超时秒数, 首次加载模型可能慢
+spawn_agent requires <path> to be a git repository.
 
-# Ollama
-MINICODE_OLLAMA_URL=http://localhost:11434
-MINICODE_MODEL=qwen2.5-coder:7b-instruct-q4_K_M
+To enable spawn_agent here, run THESE EXACT COMMANDS (the order matters —
+.gitignore MUST exist before `git add .` so secrets don't get committed):
 
-# MiniMax
-MINIMAX_API_KEY=                   # 必填 (走 minimax 时)
-MINIMAX_BASE_URL=https://api.minimaxi.com   # 不要带 /v1, client 内部拼
-MINIMAX_MODEL=MiniMax-M2.7
-MINIMAX_PRICE_IN=2.0               # ¥/M token, 用于成本估算
-MINIMAX_PRICE_OUT=8.0
+  cd <path>
+  git init
+  cat > .gitignore << 'EOF'
+  __pycache__/
+  ...
+  .env
+  .env.local
+  EOF
+  git add .
+  git commit -m 'init for minicode'
+
+WARNING: do NOT skip the .gitignore step. Without it, `git add .`
+will stage .env (with your API keys) and __pycache__/*.pyc into the
+root commit. Once committed, secrets are hard to scrub.
 ```
 
-### REPL 命令
+实测 M2.7 看到这条会**按顺序执行**: 先建 .gitignore, 再 git add, 再 commit. **.env 不会被 commit**.
+
+### 7.4 环境变量
+
+跟 05 一样, 加 spawn_agent 专属几个:
 
 ```
-/help      显示帮助
-/exit      退出
-/clear     清空对话历史 (相当于 new_session)
-/todos     显示当前 todo 列表
-/history   显示消息条数统计
+# 已有 (来自 05)
+MINICODE_BACKEND=ollama|minimax
+MINICODE_STREAM=1
+MINIMAX_API_KEY=...
+
+# v6 新增
+MINICODE_SUB_MAX_ROUNDS=10        # 子 agent 单次最多跑几轮
+MINICODE_SUB_TIMEOUT=300          # 子 agent 整体超时 (秒)
+MINICODE_SUB_DIFF_MAX=4000        # 返回 text 里 diff 截断阈值
 ```
 
 ---
 
-## 10. 已知问题 / 还能优化的地方
+## 8. 读源码的建议路线
 
-诚实交代当前状态. 这些是真实存在但暂时没修的:
+[todo.py](todo.py) ~2300 行, 在 05 的基础上加 spawn_agent 相关 ~200 行. 推荐顺序:
 
-### 已知问题
+1. **`_WORKTREE_EXCLUDE_PATTERNS` 常量** — 排除列表的 source of truth
+2. **`_git_worktree_create`** — git worktree add + 错误消息引导
+3. **`_build_pathspec_excludes` + `_git_worktree_diff`** — pathspec exclude 怎么用
+4. **`_git_worktree_remove`** — 清理逻辑 (`git worktree remove --force`)
+5. **`SUB_AGENT_SYSTEM_TEMPLATE`** — 子 agent 的 system prompt
+6. **`tool_spawn_agent`** — 主入口, 整个流程串起来
+7. **`build_subagent_registry`** — 子 agent 工具集 (主 - spawn_agent - todo)
+8. **`Session.is_subagent` 字段** — 子 session 标记, 让 NAG 跳过
 
-**A. NAG_THRESHOLD = 3 对 M2.7 偏严**
+测试: [tests/test_tools.py](tests/test_tools.py) 末尾 `TestSpawnAgent` 类, 10 个测试覆盖:
 
-老规则 "连续 3 轮没调 todo 就注入提醒" 是给 7B 的. M2.7 单步任务能力强, 不需要 todo, 被 NAG 注入提醒后没被带偏但提醒本身是噪声. 可改成"按 backend 区分阈值"或"模型 N 轮里有 1 轮调过 todo 就不 nag".
-
-**B. 模型选错工具时无系统层兜底**
-
-7B 跑 query "解释 800-900 行" 时第一轮调了 `apply_patch` 传空 patch (用户从没要求修改). 系统层没拦, 空 patch 走 PARSE_FAILED 浪费一轮. 可加: tool_call 前置 sanity (apply_patch 的 patch 字段空 → 直接拒).
-
-**C. todo 状态机没强约束**
-
-一个 todo item 可以从 completed 变回 pending. 之前 7B 跑出"摆烂复读"的根因之一. state transitions 应当是单向 DAG: pending → in_progress → completed, 不能回退. 加状态转换校验即可.
-
-**D. 错误码命名不统一**
-
-`NO_MATCH` vs `NOT_FOUND`、`BAD_ARGS` vs `BAD_REGEX`、`AMBIGUOUS` 含义不显. 模型容易搞混. 但改起来要同步改 README + 测试断言, 收益不大, 一直没做.
-
-### 真新功能 (v6 候选)
-
-**E. Session 持久化**
-
-跑 1 小时关掉 CLI 进度全丢. 加 `Session.to_dict()` / `from_dict()` + `/save name` / `/load name` 命令. ~80 行可做最简版.
-
-**F. Context 压缩**
-
-M2.7 有 200K context 暂时不紧, 但 Ollama 7B 是 32K, 长会话会撞墙. 滑动窗口最简单 (~50 行), 摘要复杂得多.
-
-**G. 子 agent**
-
-主 agent 派任务给子 agent, 子 agent 独立 session, 跑完返回摘要. Session 设计好了直接就能做, 但 7B 不适合做"派工的元认知". 留给云端模型 + 真实需求驱动时再做.
-
-**H. prompt caching**
-
-MiniMax 是否支持 cache_control / 隐式自动 caching, 没确认. 如果支持, SYSTEM 重复传的成本能再砍一半. 需要专门测.
+- 基础: 非 git workspace 报错, _SPAWN_LLM 未设报错
+- 隔离: 子 agent 改动不出现在主 workspace
+- 清理: 失败 worktree 保留, 成功删除
+- 状态: 主 WORKDIR 在 spawn 后正确恢复
+- token 累加到主 session
+- pathspec exclude 生效 (.pyc/.gitignore 不进 diff)
+- 错误消息含 git init 引导
 
 ---
 
-## 11. 给后来者: 如果你想读源码
+## 9. 已知局限
 
-[todo.py](todo.py) 一个文件 ~2000 行. 推荐阅读顺序:
+诚实交代:
 
-1. **顶部配置 + .env loader** (~150 行) — 看懂 BACKEND / 环境变量怎么进来的
-2. **`ToolResult` + `Message` + `Tool` + `Session`** (~250 行) — 4 个核心数据结构
-3. **`_OpenAICompatClient` + `OllamaClient` + `MinimaxClient`** (~150 行) — HTTP + SSE + reassembly
-4. **`_StreamRenderer`** (~80 行) — 流式渲染细节, 关键陷阱注释里都有
-5. **`ToolRegistry.dispatch`** (~50 行) — _session 注入 + read-before-write 守卫
-6. **每个 tool_xxx 函数** — 平铺, 一个一个看, LS / Glob / Grep / Read / Write / Append / Edit / apply_patch
-7. **`apply_patch` 三阶段** — 这是工具层最复杂的一段. 见 04 README 也讲过
-8. **`ReActAgent.run` 主循环** — 把所有东西串起来
-
-每个段落顶部都有 `# ===` 边框 + 中文标题. 跟着边框扫就能看清结构.
-
-测试: [tests/test_tools.py](tests/test_tools.py) 66 个测试, 全部不依赖网络 / 模型, 跑 `pytest tests/` 一秒内出结果. 看测试比看代码更快理解工具的契约.
-
-探针: [scripts/](scripts/) 有 `probe_stream_v3.py` 测 SSE 协议、`probe_minimax.py` 测真 MiniMax 端点. 不进生产代码, 但**有用**——以后 backend 行为变了 (比如 Ollama 升级了流式协议), 跑探针就知道.
+| 局限 | 严重度 | 备注 |
+|---|---|---|
+| 7B 在 spawn_agent 上不可靠 | 🟧 设计权衡 | 切 MiniMax-M2.7. 7B 元认知不够派工 |
+| 同步阻塞 — 不支持并行多个 spawn_agent | 🟨 简单胜复杂 | 单机 GPU 同时也只能一个推理. 云端能并行但实现复杂度大 |
+| 模块级 WORKDIR 在 spawn 期间被 monkey-patch | 🟨 设计权衡 | spawn_agent 跑时把 module-level WORKDIR 临时指 worktree, 跑完恢复. 不优雅但可工作. 真正干净的做法是把 WORKDIR 进 Session, 是 v7 的事 |
+| 主 agent 用 ``` 块显示 diff | 🟨 模型行为 | SYSTEM 警告"不要用 ```diff 块", M2.7 改用无 lang 的 ```. 没触发 codeblock NAG, 算擦边过. 不修了 |
+| 子 agent 仍可能 cd 到 worktree | 🟨 模型行为 | SYSTEM 写了"不要 cd", M2.7 偶尔仍 cd. 不影响结果, 不修 |
+| 要求主 workspace 是 git repo | 🟧 设计前提 | 不在 git repo 里跑直接报 WORKTREE_FAILED 并教用户怎么 init |
 
 ---
 
-## 历史包袱: 04 / 03 / 02 / 01 都做了什么
+## 10. v6 → v7 候选方向
+
+按"真痛点 vs 假想需求"排:
+
+**真痛点, v7 应该做**:
+- **Session 持久化** — 跑一半关电脑下次接着跑. 一直没做的"基础设施"型功能. ~80 行
+- **WORKDIR 进 Session** — 当前模块级 monkey-patch 是真技术债. 跟 spawn_agent 联系起来时尤其明显
+- **Context 压缩** — 长会话撞 context 上限. M2.7 是 200K, 暂时不紧, 但 7B 是 32K
+
+**假想需求, 不该做**:
+- 子 agent 并发 — 单机场景没意义
+- 子 agent 跨 backend (主 MiniMax, 子 Ollama) — 用户可以**整体**切 backend, 不需要这种复杂度
+- 多层子 agent (深度 2+) — 7B 递归爆炸, M2.7 也没强需求
+
+**真要做但很复杂**:
+- 子 agent 失败时的精细恢复策略 — 现在简单粗暴 "失败保留 worktree". 想搞"自动重试"会引入新问题
+- prompt caching — MiniMax 是否原生支持没确认, 调研工作量不小
+
+---
+
+## 历史包袱: 05 / 04 / 03 / 02 / 01 都做了什么
 
 不在这份 README 重写 — 各自 README 仍然有效:
 
-- [04-structured-tool-calls/](../04-structured-tool-calls/) — Ollama 后端 + structured tool_calls + apply_patch + 66 个测试. 是当前 v5 的直接前身
-- [03-atomic-tools/](../03-atomic-tools/) — 三层工具架构 + 读后写乐观锁 + 42 个测试 + CI. 工具层第一次做扎实
-- [02-sandboxed/](../02-sandboxed/) — REPL + bash 沙箱探测 + 大文件分片写入. 从一次性脚本进化成日常工具
-- [01-bash-only/](../01-bash-only/) — 最小 ReAct + 5 个工具. 看清骨架最快
+- [05-session-and-streaming/](../05-session-and-streaming/) — Session 状态管理 + 流式 + 双后端 + token 可见. 06 直接继承, 是 v6 的全部基础
+- [04-structured-tool-calls/](../04-structured-tool-calls/) — Ollama 后端 + structured tool_calls + apply_patch
+- [03-atomic-tools/](../03-atomic-tools/) — 三层工具架构 + 读后写乐观锁 + 42 测试 + CI
+- [02-sandboxed/](../02-sandboxed/) — REPL + bash 沙箱探测 + 大文件分片
+- [01-bash-only/](../01-bash-only/) — 最小 ReAct + 5 工具
 
-按版本号往回读, 能看清 agent 是怎么从"能跑"长到"能用"的. 每一版只引入一两个新概念, 改动可控.
+按版本号顺序读, 能看清"agent 是怎么从单进程脚本长到能派子任务" 的全过程.
 
 ---
 
 ## 一句话总结
 
-**v5 不是加了什么新酷炫能力, 是把"用着别扭"的几个具体地方一个一个修了.** Session 让状态收口, 流式让等待变成观察, 双后端让 7B 不再是天花板, token 可见让花钱有数, 系统层兜底让 prompt 不再是孤军奋战.
+**v6 不是"加了酷炫的多 agent 能力". v6 解决的是一个具体痛点: 用户说"试一下"时, 怎么不污染主 workspace.** 5 次实测, 5 个 commit, 每次都基于真问题修. 最终 spawn_agent 工作流闭环 — 隔离 worktree → 子 agent 跑 → 真 diff 回到主 agent → 询问用户是否采纳.
 
-每件事都是有理由地做, 也都留了"做得不完美的地方"在 §10. 这是一个真实的迭代记录, 不是产品宣传.
+技术上不复杂 (~200 行新代码 + 10 个测试). 难的是**让模型真用 spawn_agent**, 不是"工具存在"那么简单. SYSTEM 写法 / 工具 description 写法 / few-shot 例子 — 三处都得到位才行. 跟 04/05 的"prompt 是软约束, 系统是硬约束"原则一脉相承.
