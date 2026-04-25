@@ -20,7 +20,7 @@
 
 - 每个项目都是**一个 Python 文件**, 没有任何抽象
 - 整个 ReAct 循环大约 **30 行代码**, 摊开就能看完
-- 五个迭代版本展示**一个真实 agent 是怎么从 MVP 长出来的** — 一路加上测试、沙箱、乐观锁、流式、云端切换
+- 六个迭代版本展示**一个真实 agent 是怎么从 MVP 长出来的** — 一路加上测试、沙箱、乐观锁、流式、云端切换、子 agent
 
 看遍了 langchain / autogen 的教程, 还是不知道 agent 内部到底怎么转? 读源码, 不要读框架文档.
 
@@ -28,7 +28,7 @@
 
 - ❌ 不是框架 — 别 `pip install`, 直接读代码
 - ❌ 不适合生产 — 没有重试 / 可观测 / 多租户
-- ❌ 不是多 agent — 当前单 agent 单会话 (子 agent 在 05 §10 列为 v6 候选, 没承诺)
+- ❌ 不是真"多 agent 系统" — 06 加了 `spawn_agent` (主 agent 派子 agent 在隔离 worktree 里跑探索式任务), 但**深度限制 1, 同步阻塞**. 不支持并行多 agent / 复杂分布式
 
 **关于后端**: 默认本地 Ollama 跑 7B, 也可一行切到云端 MiniMax-M2.7. 这是**能力**, 不是"不是什么".
 
@@ -45,7 +45,7 @@
 | [03-atomic-tools/](03-atomic-tools/) | 封存 | 三层工具架构 (LS/Glob/Grep/Read 原子层) + 读后写乐观锁 (mtime+size cache, NOT_READ/CONFLICT) + 42 个 pytest + GitHub Actions CI | 想看怎么把 agent **做扎实**, 经得起测试 |
 | [04-structured-tool-calls/](04-structured-tool-calls/) | 封存 | 后端换 Ollama HTTP (默认 qwen2.5-coder:7b, 能力跳档) + OpenAI 结构化 tool_calls + `apply_patch` 跨文件 unified diff (两阶段锁 + 原子回滚) + 66 个 pytest | 想看 agent 怎么从"能跑"演进到**跨文件原子改动** |
 | [05-session-and-streaming/](05-session-and-streaming/) | 封存 | Session 状态管理 + 流式输出 + Ctrl-C 中断 + 双后端 (Ollama / MiniMax-M2.7 二选一) + token/成本可见 + 代码块伪 tool_call 系统层兜底 + 安全脚手架 (.env / pre-commit hook) | 想看 agent 怎么从"能跑"长出**能用的体感** |
-| [06-sub-agents/](06-sub-agents/) | ✅ **活跃** | spawn_agent 工具 — 在隔离 git worktree 里派子 agent 跑探索式任务, 子 agent 改动以 unified diff 形式回到主 agent, 主 agent 决定是否 apply 到主 workspace + 73 个 pytest (66 继承 + 7 新增) | 想看子 agent 范式怎么落地 / 想跑"试个改动但不污染主流程"的工作流 — 也是想实际用的默认推荐 |
+| [06-sub-agents/](06-sub-agents/) | ✅ **活跃** | `spawn_agent` 工具 — 用户说"试一下" 时主 agent 派子 agent 在隔离 git worktree 里跑, 改动以 unified diff 回到主 agent, 主 agent 询问用户是否采纳 (主 workspace 全程不动) + 76 个 pytest (66 继承 + 10 新增) + 5 次实测踩坑迭代验证完整闭环 | 想看子 agent 范式怎么落地 / 想跑"试个改动但不污染主流程"的工作流 — 也是想实际用的默认推荐 |
 
 每一版都只有一个 `todo.py` 文件 — **你看到的就是全部真相**, 没有任何框架包装.
 
@@ -53,11 +53,11 @@
 
 ## 学习路径 — 怎么挑该读哪一版
 
-**默认推荐 (想跑起来用)**: 直接去 [06-sub-agents](06-sub-agents/). 当前活跃版本, 在 05 全部能力之上加 `spawn_agent` 工具.
+**默认推荐 (想跑起来用)**: 直接去 [06-sub-agents](06-sub-agents/). 当前活跃版本, 在 05 基础上加 `spawn_agent` 工具. README 700 行, 含 5 次实测踩坑迭代的完整复盘 (§4 修复迭代是核心干货).
 
-**想看最完整的 README**: [05-session-and-streaming](05-session-and-streaming/). 06 README 顶部是 v6 摘要, 主体仍引用 05 — 05 README 736 行讲了 Session / 流式 / 双后端 / token 可见 / 代码块兜底等每个能力的"为什么做、怎么做、起没起效果、中间踩的坑".
+**想看 agent 怎么从"能跑"长出"能用的体感"**: [05-session-and-streaming](05-session-and-streaming/). README 736 行, 讲了 Session / 流式 / 双后端 / token 可见 / 代码块兜底等每个能力的"为什么做、怎么做、起没起效果、中间踩的坑".
 
-**完全新手, 第一次看 AI agent**: 从 [01-bash-only](01-bash-only/) 开始读源码. 整个 todo.py 369 行, ReAct 循环就 30 行——这是看清"agent 到底是什么"最快的路. 但**实际跑用 04 / 05**, 01 是教学快照.
+**完全新手, 第一次看 AI agent**: 从 [01-bash-only](01-bash-only/) 开始读源码. 整个 todo.py 369 行, ReAct 循环就 30 行——这是看清"agent 到底是什么"最快的路. 但**实际跑用 06 / 05**, 01 是教学快照.
 
 **已经知道 ReAct, 想看 agent 怎么"做扎实"**: 跳到 [03-atomic-tools](03-atomic-tools/). 工具分层 / 读后写乐观锁 / pytest / CI 这些工程实践集中在这一版引入.
 
@@ -109,17 +109,17 @@ python todo.py
   - 04 / 05: OpenAI 结构化 `tool_calls` 字段 (后端 Ollama 或 MiniMax)
 - **核心范式**: ReAct (Thought → Action → Observation) 循环 + 工具表分发
 - **沙箱**: 基于路径, 在工具层强制, 不依赖 prompt
-- **测试**: pytest. 03 引入 (42 个), 04 / 05 各 66 个. conftest.py 把 torch / transformers stub 掉, CI 不需要装 ML 栈
+- **测试**: pytest. 03 引入 (42 个), 04 / 05 各 66 个, 06 加 spawn_agent 专项 (76 个). conftest.py 把 torch / transformers stub 掉, CI 不需要装 ML 栈
 
 ## 测试
 
-CI 矩阵每次 push 自动跑全部 5 个版本 — 见 [.github/workflows/test.yml](.github/workflows/test.yml).
+CI 矩阵每次 push 自动跑全部 6 个版本 — 见 [.github/workflows/test.yml](.github/workflows/test.yml).
 
 本地跑 (任选一个, 不需要全跑):
 
 ```bash
-cd 05-session-and-streaming                                  # 推荐: 当前活跃版本
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/               # 66 个, ~0.8s
+cd 06-sub-agents                                             # 推荐: 当前活跃版本
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/               # 76 个, ~5s
 ```
 
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` 是绕过本地环境里冲突的 pytest 插件 (比如 langsmith). 没冲突就不用加.
@@ -138,4 +138,4 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/               # 66 个, ~0.8s
 
 ## Keywords
 
-`qwen` `qwen3` `qwen2.5-coder` `minimax` `minimax-m2` `ollama` `local-llm` `coding-agent` `react-agent` `ai-agent` `tool-use` `function-calling` `llm-agent` `no-framework` `educational` `single-file` `react-loop` `python` `from-scratch` `streaming` `apply-patch` `unified-diff` `optimistic-locking` `session-management`
+`qwen` `qwen3` `qwen2.5-coder` `minimax` `minimax-m2` `ollama` `local-llm` `coding-agent` `react-agent` `ai-agent` `tool-use` `function-calling` `llm-agent` `no-framework` `educational` `single-file` `react-loop` `python` `from-scratch` `streaming` `apply-patch` `unified-diff` `optimistic-locking` `session-management` `sub-agent` `spawn-agent` `git-worktree`
