@@ -34,9 +34,9 @@
 
 ---
 
-## 五个版本 — 一个活跃, 四个封存快照
+## 六个版本 — 一个活跃, 五个封存快照
 
-每一版只引入一两个新概念, 改动可控, 跟着版本号往后读就能看清"agent 是怎么从能跑长到能用的". **04 之前都已封存** (作为历史快照保留, 不再改), 当前活跃版本是 **05-session-and-streaming**.
+每一版只引入一两个新概念, 改动可控, 跟着版本号往后读就能看清"agent 是怎么从能跑长到能用的". **05 之前都已封存** (作为历史快照保留, 不再改), 当前活跃版本是 **06-sub-agents**.
 
 | 目录 | 状态 | 这一版的核心新东西 | 适合谁读 |
 |---|---|---|---|
@@ -44,7 +44,8 @@
 | [02-sandboxed/](02-sandboxed/) | 封存 | 加交互式 REPL + bash 沙箱探测 (排除 WSL System32, 避免 UTF-16 输出冲突) + 大文件分片写入 | 想看 agent 怎么从一次性脚本演化成**可用的日常工具** |
 | [03-atomic-tools/](03-atomic-tools/) | 封存 | 三层工具架构 (LS/Glob/Grep/Read 原子层) + 读后写乐观锁 (mtime+size cache, NOT_READ/CONFLICT) + 42 个 pytest + GitHub Actions CI | 想看怎么把 agent **做扎实**, 经得起测试 |
 | [04-structured-tool-calls/](04-structured-tool-calls/) | 封存 | 后端换 Ollama HTTP (默认 qwen2.5-coder:7b, 能力跳档) + OpenAI 结构化 tool_calls + `apply_patch` 跨文件 unified diff (两阶段锁 + 原子回滚) + 66 个 pytest | 想看 agent 怎么从"能跑"演进到**跨文件原子改动** |
-| [05-session-and-streaming/](05-session-and-streaming/) | ✅ **活跃** | Session 状态管理 + 流式输出 + Ctrl-C 中断 + 双后端 (Ollama / MiniMax-M2.7 二选一) + token/成本可见 + 代码块伪 tool_call 系统层兜底 + 安全脚手架 (.env / pre-commit hook) | 想看 agent 怎么从"能跑"长出**能用的体感** — 也是想跑起来实际用的默认推荐 |
+| [05-session-and-streaming/](05-session-and-streaming/) | 封存 | Session 状态管理 + 流式输出 + Ctrl-C 中断 + 双后端 (Ollama / MiniMax-M2.7 二选一) + token/成本可见 + 代码块伪 tool_call 系统层兜底 + 安全脚手架 (.env / pre-commit hook) | 想看 agent 怎么从"能跑"长出**能用的体感** |
+| [06-sub-agents/](06-sub-agents/) | ✅ **活跃** | spawn_agent 工具 — 在隔离 git worktree 里派子 agent 跑探索式任务, 子 agent 改动以 unified diff 形式回到主 agent, 主 agent 决定是否 apply 到主 workspace + 73 个 pytest (66 继承 + 7 新增) | 想看子 agent 范式怎么落地 / 想跑"试个改动但不污染主流程"的工作流 — 也是想实际用的默认推荐 |
 
 每一版都只有一个 `todo.py` 文件 — **你看到的就是全部真相**, 没有任何框架包装.
 
@@ -52,7 +53,9 @@
 
 ## 学习路径 — 怎么挑该读哪一版
 
-**默认推荐 (想跑起来用 / 想看最完整的 README)**: 直接去 [05-session-and-streaming](05-session-and-streaming/). 这是唯一活跃版本, README 736 行, 每个能力的"为什么做、怎么做、起没起效果、中间踩的坑"都讲了.
+**默认推荐 (想跑起来用)**: 直接去 [06-sub-agents](06-sub-agents/). 当前活跃版本, 在 05 全部能力之上加 `spawn_agent` 工具.
+
+**想看最完整的 README**: [05-session-and-streaming](05-session-and-streaming/). 06 README 顶部是 v6 摘要, 主体仍引用 05 — 05 README 736 行讲了 Session / 流式 / 双后端 / token 可见 / 代码块兜底等每个能力的"为什么做、怎么做、起没起效果、中间踩的坑".
 
 **完全新手, 第一次看 AI agent**: 从 [01-bash-only](01-bash-only/) 开始读源码. 整个 todo.py 369 行, ReAct 循环就 30 行——这是看清"agent 到底是什么"最快的路. 但**实际跑用 04 / 05**, 01 是教学快照.
 
@@ -62,7 +65,7 @@
 
 **关心架构演化**: 按版本号顺序读各版 README — 不读源码也能看清"工具单一返回 → 三层架构 → 流式 + Session + 双后端"这条线. 每个 README 都有"上一版痛点 / 这一版怎么改 / 起没起效果"段, 互相交叉引用.
 
-## 快速开始 — 默认走 05
+## 快速开始 — 默认走 06
 
 ```bash
 git clone https://github.com/xu-kai-quan/MiniCode-Agent.git
@@ -71,7 +74,7 @@ cd MiniCode-Agent
 # 装 Ollama 桌面版: https://ollama.com/
 ollama pull qwen2.5-coder:7b-instruct-q4_K_M
 
-cd 05-session-and-streaming
+cd 06-sub-agents
 python todo.py
 ```
 
@@ -80,7 +83,7 @@ python todo.py
 **想用云端大模型** (MiniMax-M2.7, 任务连续性显著好):
 
 ```bash
-cd 05-session-and-streaming
+cd 06-sub-agents
 cp .env.example .env
 # 编辑 .env: MINICODE_BACKEND=minimax + MINIMAX_API_KEY=<你的 key>
 python todo.py
